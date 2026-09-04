@@ -1,0 +1,2 @@
+meshcore>=2.3.9.1
+zstandard>=0.25.0

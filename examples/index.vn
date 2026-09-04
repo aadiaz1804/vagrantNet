@@ -1,0 +1,15 @@
+# Welcome to vagrantNet
+
+This is a test node running the vagrantNet reference daemon.
+
+## About
+
+vagrantNet serves pages and files over MeshCore's raw-data transport,
+point-to-point, without broadcasting to a channel.
+
+[Files|files]
+[Help|help.vn]
+
+> Pages should stay under ~10KB uncompressed -- (compressed by the webserver)
+
+---

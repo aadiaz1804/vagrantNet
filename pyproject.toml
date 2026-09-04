@@ -1,0 +1,12 @@
+[project]
+name = "vagrantnet"
+version = "0.1.0"
+description = "A bulletin-board protocol over MeshCore's raw-data transport"
+requires-python = ">=3.10"
+dependencies = [
+    "meshcore>=2.3.9.1",
+    "zstandard>=0.25.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["vagrantnet/tests"]

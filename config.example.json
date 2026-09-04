@@ -1,0 +1,13 @@
+{
+  "node_name": "vagrantNet Test Node",
+  "pages_dir": "~/vn/pages",
+  "downloads_dir": "~/vn/content",
+  "connection": {
+    "kind": "serial", 
+    "target": "/dev/ttyUSB0",
+    "baudrate": 115200
+  },
+  "max_in_flight_transfers_per_client": 2,
+  "max_in_flight_transfers_total": 8,
+  "content_token_ttl_seconds": 300
+}
