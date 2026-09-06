@@ -78,5 +78,13 @@ class ClientConfig:
 
     def remove_favorite(self, index: int) -> Favorite | None:
         if 0 <= index < len(self.favorites):
-            return self.favorites.pop(index)
+            fav = self.favorites.pop(index)
+            self.save()
+            return fav
         return None
+
+    def remove_server(self, name: str) -> str | None:
+        pubkey = self.servers.pop(name, None)
+        if pubkey is not None:
+            self.save()
+        return pubkey
