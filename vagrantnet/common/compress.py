@@ -1,5 +1,4 @@
 """zstd wrapper for page/file payloads. Falls back to no dictionary until one is trained."""
-# TODO: Fallback to a default/common dictionary if one doesnt exist.
 
 from __future__ import annotations
 from pathlib import Path
@@ -23,7 +22,6 @@ def decompress(data: bytes, dict_path: Path | None = None) -> bytes:
     dctx = zstd.ZstdDecompressor(dict_data=zdict) if zdict else zstd.ZstdDecompressor()
     return dctx.decompress(data)
 
-# TODO: (Strech goal) Add a easy way for the user to train a dict on their favorite or own pages, compare if it's better than the default, and use it for future fetches.
 def train_dictionary(sample_paths: list[Path], out_path: Path, dict_size: int = 4096) -> None:
     """One-off: train a dictionary from a subset of .vn pages."""
     samples = [p.read_bytes() for p in sample_paths if p.stat().st_size > 0]

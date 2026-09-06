@@ -17,7 +17,6 @@ from dataclasses import dataclass
 
 LINK_RE = re.compile(r"^\[(?P<label>[^|\]]+)\|(?P<path>[^\]]+)\]$")
 
-# TODO: Check if more ANSI codes are worth supporting
 _ANSI_RESET = "\x1b[0m"
 _ANSI_BOLD = "\x1b[1m"
 _ANSI_UNDERLINE = "\x1b[4m"
@@ -28,8 +27,6 @@ class Link:
     label: str
     path: str
 
-# TODO: Check if ANSI links are better than the custom format
-# If so extract_links and link match are not needed, and render_ansi can be simplified to just return the text with ANSI codes.
 def extract_links(vn_text: str) -> list[Link]:
     """Pull out every [Label|path] link, in document order."""
     links: list[Link] = []
@@ -51,7 +48,6 @@ def render_ansi(vn_text: str) -> str:
                 f"  {_ANSI_UNDERLINE}{link_match.group('label')}"
                 f"{_ANSI_RESET} {_ANSI_DIM}[{link_match.group('path')}]{_ANSI_RESET}"
             )
-        # TODO: Check rendering of headings
         elif stripped.startswith("### "):
             out_lines.append(f"{_ANSI_BOLD}{stripped[4:]}{_ANSI_RESET}")
         elif stripped.startswith("## "):
@@ -71,7 +67,6 @@ def validate(vn_text: str, max_bytes: int = 10_240) -> list[str]:
     """Non-fatal lint: returns warnings, never raises."""
     warnings: list[str] = []
     size = len(vn_text.encode("utf-8"))
-    # TODO: Consider pre-compressing instead of checking uncompressed size.
     if size > max_bytes:
         warnings.append(
             f"page is {size} bytes uncompressed, over the recommended "

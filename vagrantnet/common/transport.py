@@ -149,6 +149,7 @@ async def connect_serial(
     *,
     auto_reconnect: bool = True,
     max_reconnect_attempts: int = DEFAULT_MAX_RECONNECT_ATTEMPTS,
+    quiet: bool = False,
     pulse_before_first_connect: bool = False,
 ) -> MeshCore | None:
     """Mirrors MeshCore.create_serial(), but with the hygiene-wrapped
@@ -160,6 +161,7 @@ async def connect_serial(
         connection,
         auto_reconnect=auto_reconnect,
         max_reconnect_attempts=max_reconnect_attempts,
+        only_error=quiet,
     )
     try:
         result = await mc.connect()
@@ -179,6 +181,7 @@ async def connect_ble(
     *,
     auto_reconnect: bool = True,
     max_reconnect_attempts: int = DEFAULT_MAX_RECONNECT_ATTEMPTS,
+    quiet: bool = False,
     force_disconnect_before_first_connect: bool = True,) -> MeshCore | None:
     #Mirrors MeshCore.create_ble(), but with autoconnect
     connection = _ResilientBLEConnection(
@@ -190,6 +193,7 @@ async def connect_ble(
         connection,
         auto_reconnect=auto_reconnect,
         max_reconnect_attempts=max_reconnect_attempts,
+        only_error=quiet,
     )
     try:
         result = await mc.connect()

@@ -81,7 +81,7 @@ class VagrantNetDaemon:
             )
             if attempt < CONNECT_MAX_ATTEMPTS:
                 await asyncio.sleep(CONNECT_RETRY_DELAY_SECONDS)
-    # TODO: Check if the daemon should use the repeater or roomServer firmware instead
+
         if self.mc is None:
             raise RuntimeError(
                 f"failed to connect to MeshCore device ({conn.kind}:{conn.target}) "
@@ -211,7 +211,6 @@ class VagrantNetDaemon:
 
         compressed = compress.compress(uncompressed)
         # only worth using the compressed form if it's actually smaller
-        # TODO: consider an algorithm for compression for small pages that can lose to zstd's frame overhead
         use_compressed = len(compressed) < len(uncompressed) and req.prefer_compressed
         payload = compressed if use_compressed else uncompressed
 
@@ -372,7 +371,6 @@ class VagrantNetDaemon:
             total_chunks=total_chunks if chunk_number == 0 else None,
         )
 
-        # TODO: Increase robustness of the send tuned for multiple hops, clients and repeaters.
         payload = resp.encode()
         logger.info(
             "send_raw_data: request %s chunk %d (%d bytes)",

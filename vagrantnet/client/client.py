@@ -24,7 +24,10 @@ from ..common.page import render_ansi
 
 logger = logging.getLogger("vagrantnet.client")
 
-CHUNK_TIMEOUT_SECONDS = 15.0
+# Base timeout 5s which increases by 5s per hop
+CHUNK_TIMEOUT_BASE_SECONDS = 5.0
+CHUNK_TIMEOUT_PER_HOP_SECONDS = 5.0
+CHUNK_TIMEOUT_MAX_SECONDS = 35.0  # Max timeout
 # Total time willing to keep retrying one chunk before surfacing an error
 CHUNK_RETRY_DEADLINE_SECONDS = 90.0
 CHUNK_RETRY_JITTER_SECONDS = (0.5, 2.0)
@@ -40,6 +43,12 @@ _BLE_ADDRESS_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 
 class VagrantNetError(RuntimeError):
     pass
+
+def _chunk_timeout(hops: int) -> float:
+    return min(
+        CHUNK_TIMEOUT_BASE_SECONDS + CHUNK_TIMEOUT_PER_HOP_SECONDS * max(hops, 0),
+        CHUNK_TIMEOUT_MAX_SECONDS,
+    )
 
 async def _retry(coro_fn, *, attempts: int, delay: float, what: str):
     # Retry for a first connect attempt
@@ -67,16 +76,19 @@ class _Dial:
     target: str
     baudrate: int = 115200
     pin: str | None = None
+    quiet: bool = False  # suppress the meshcore library's INFO chatter
 
 async def _dial(d: _Dial) -> MeshCore:
     async def _try(attempt: int) -> MeshCore:
         if d.kind == "ble":
             mc = await transport.connect_ble(
-                d.target, pin=d.pin, force_disconnect_before_first_connect=attempt == 1
+                d.target, pin=d.pin, quiet=d.quiet,
+                force_disconnect_before_first_connect=attempt == 1,
             )
         else:
             mc = await transport.connect_serial(
-                d.target, d.baudrate, pulse_before_first_connect=attempt > 1
+                d.target, d.baudrate, quiet=d.quiet,
+                pulse_before_first_connect=attempt > 1,
             )
         if mc is None:
             raise ConnectionError(f"could not connect to MeshCore device at {d.target}")
@@ -108,15 +120,17 @@ class VagrantNetClient:
         self.mc.subscribe(EventType.DISCONNECTED, self._on_disconnected)
 
     @classmethod
-    # TODO: Support having vagrantNetClient and MeshCore cli/clients at the same time
-    # (Maybe a middleware layer to avoid the /dev/ttyUSBX interface being locked by MeshCore CLI or vagrantNetClient)
-    async def connect_serial(cls, port: str, baudrate: int = 115200) -> "VagrantNetClient":
-        dial = _Dial("serial", port, baudrate=baudrate)
+    async def connect_serial(
+        cls, port: str, baudrate: int = 115200, *, quiet: bool = False
+    ) -> "VagrantNetClient":
+        dial = _Dial("serial", port, baudrate=baudrate, quiet=quiet)
         return await cls._ready(await _dial(dial), dial)
 
     @classmethod
-    async def connect_ble(cls, address: str, pin: str | None = None) -> "VagrantNetClient":
-        dial = _Dial("ble", address, pin=pin)
+    async def connect_ble(
+        cls, address: str, pin: str | None = None, *, quiet: bool = False
+    ) -> "VagrantNetClient":
+        dial = _Dial("ble", address, pin=pin, quiet=quiet)
         return await cls._ready(await _dial(dial), dial)
 
     @classmethod
@@ -124,7 +138,6 @@ class VagrantNetClient:
         # No bulk contacts sync for speed, after radio is ready we only ask for the one contact we need for the server's pk.
         await mc.commands.send_device_query()
         # Do a quick advert without flood to get near repeaters
-        # TODO: Check if it's worth doing a flood advert or give an option to the end user
         await mc.commands.send_advert(flood=False)
         client = cls(mc, dial)
         if dial is not None:
@@ -213,7 +226,7 @@ class VagrantNetClient:
         if pending is not None and not pending.future.done():
             pending.future.set_result(resp)
 
-    async def _resolve_path(self, server_pubkey_hex: str) -> bytes:
+    async def _resolve_path(self, server_pubkey_hex: str) -> tuple[bytes, int]:
         pubkey = bytes.fromhex(server_pubkey_hex)
         contact: dict = {}
         for attempt in range(1, CONTACT_LOOKUP_MAX_ATTEMPTS + 1):
@@ -235,7 +248,10 @@ class VagrantNetClient:
                 f"Server {server_pubkey_hex[:12]}... has no known path yet -- "
                 "wait for a server/repeater advert before fetching"
             )
-        return bytes.fromhex(contact.get("out_path") or "")
+        return (
+            bytes.fromhex(contact.get("out_path") or ""),
+            max(int(contact.get("out_path_len", 0)), 0),
+        )
 
     def _own_pubkey_prefix(self) -> bytes:
         pk_hex = self.mc.self_info.get("public_key")
@@ -244,11 +260,12 @@ class VagrantNetClient:
         return bytes.fromhex(pk_hex)[:6]
 
     async def _send_and_wait(
-        self, server_path: bytes, req: Request
+        self, server_path: bytes, req: Request, timeout: float
     ) -> Response:
         loop = asyncio.get_event_loop()
         last_error: Exception | None = None
-        deadline = loop.time() + CHUNK_RETRY_DEADLINE_SECONDS
+        # A long path needs a long per-chunk timeout so this increases the retry 
+        deadline = loop.time() + max(CHUNK_RETRY_DEADLINE_SECONDS, timeout * 3)
         attempt = 0
 
         while True:
@@ -260,7 +277,7 @@ class VagrantNetClient:
                     "send_raw_data: request_id=%s attempt %d", req.request_id, attempt
                 )
                 await self.mc.commands.send_raw_data(req.encode(), path=server_path)
-                resp = await asyncio.wait_for(fut, timeout=CHUNK_TIMEOUT_SECONDS)
+                resp = await asyncio.wait_for(fut, timeout=timeout)
                 return resp
             except EnvelopeError:
                 raise  # unencodable frame
@@ -287,9 +304,16 @@ class VagrantNetClient:
     async def fetch(
         self, server_pubkey_hex: str, subcommand: Subcommand, path: str = ""
     ) -> bytes:
-        """Fetch a page/file/listing, following the CONTINUE chain until the
-        final chunk, and return the fully reassembled, decompressed bytes."""
-        server_path = await self._resolve_path(server_pubkey_hex)
+        # Fetch a page/file/listing, following the CONTINUE chain until the
+        # final chunk, and return the fully reassembled, decompressed bytes.
+        server_path, hops = await self._resolve_path(server_pubkey_hex)
+        timeout = _chunk_timeout(hops)
+        logger.info(
+            "path to %s: %d hop(s), chunk timeout %.0fs",
+            server_pubkey_hex[:12],
+            hops,
+            timeout,
+        )
         own_prefix = self._own_pubkey_prefix()
 
         req_id = random.randint(0, 0xFFFF)
@@ -300,7 +324,7 @@ class VagrantNetClient:
             chunk_number=0,
             path=path,
         )
-        resp = await self._send_and_wait(server_path, req)
+        resp = await self._send_and_wait(server_path, req, timeout)
 
         if resp.status != StatusCode.OK:
             raise VagrantNetError(f"server returned {resp.status.name} for {path!r}")
@@ -322,7 +346,7 @@ class VagrantNetClient:
                 chunk_number=chunk_n,
                 content_token=content_token,
             )
-            cont_resp = await self._send_and_wait(server_path, cont_req)
+            cont_resp = await self._send_and_wait(server_path, cont_req, timeout)
             if cont_resp.status == StatusCode.UNKNOWN_TOKEN:
                 raise VagrantNetError(
                     "[Server] transfer lost (restarted, or expired request) Restart the fetch from the beginning"
@@ -370,7 +394,6 @@ async def _main(argv: list[str]) -> None:
 
     if len(positional) < 3:
         print(
-            # TODO: Make this a TUI browser-style interface, with a list of known/favorite and their pages, and a way to select and fetch them.
             "usage: python -m vagrantnet.client.client <serial-port|ble-address> "
             "<server-pubkey-hex> <get-page|get-file|list-pages> [path] [--pin=XXXXXX]"
         )

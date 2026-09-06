@@ -9,8 +9,6 @@ from enum import IntEnum
 PROTO_MARKER = 0b01  # top 2 bits of ctrl byte; soft sanity check, not crypto
 VERSION = 1
 
-# TODO: shrink request_id from 2 bytes to 1 to claw back header room
-# (content_token is already 1 byte). Low priority
 MAX_SAFE_PAYLOAD = 160 # Max verified payload size for a single CMD_SEND_RAW_DATA
 MAX_TOTAL_CHUNKS = 0xFF        # total_chunks is one byte
 MAX_UNCOMPRESSED_SIZE = 0xFFFF  # uncompressed_size is two bytes
@@ -24,7 +22,7 @@ class MsgType(IntEnum):
 class Subcommand(IntEnum):
     GET_PAGE = 0
     GET_FILE = 1
-    LIST_PAGES = 2 # TODO: Maybe fold into GET_PAGE with a vn:// path prefix?
+    LIST_PAGES = 2
     CONTINUE = 3  # fetch next chunk of an already-started transfer, by token
 
 class StatusCode(IntEnum):
