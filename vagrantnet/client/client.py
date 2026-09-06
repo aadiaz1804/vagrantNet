@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from meshcore import EventType, MeshCore
 
-from ..common import chunking, compress
+from ..common import chunking, compress, transport
 from ..common.envelope import (
     EnvelopeError,
     Request,
@@ -25,7 +25,12 @@ from ..common.page import render_ansi
 logger = logging.getLogger("vagrantnet.client")
 
 CHUNK_TIMEOUT_SECONDS = 15.0
-MAX_RETRIES_PER_CHUNK = 2
+# Total time willing to keep retrying one chunk before surfacing an error --
+# TCP-like: link drops and lost packets are invisible retries up to this
+# point, not a fixed attempt count, since real LoRa loss rates don't fit a
+# "3 tries and give up" model (see NOTES.md, ~1/3 arrival rate observed).
+CHUNK_RETRY_DEADLINE_SECONDS = 90.0
+CHUNK_RETRY_JITTER_SECONDS = (0.5, 2.0)
 CONNECT_MAX_ATTEMPTS = 4
 CONNECT_RETRY_DELAY_SECONDS = 3.0
 CONTACT_LOOKUP_MAX_ATTEMPTS = 8
@@ -37,8 +42,11 @@ class VagrantNetError(RuntimeError):
     pass
 
 async def _retry(coro_fn, *, attempts: int, delay: float, what: str):
-    # TODO: Make this more resilient to LoRa link drops, it should be seamless like a TCP connection up until the timeout.
-    # For now this is a simple retry
+    """Bounded retry for a first connect attempt -- there's no live session
+    to fall back on yet, so unlike CHUNK_RETRY_DEADLINE_SECONDS this has to
+    give up eventually rather than retry indefinitely. Once connected,
+    `transport.connect_serial`/`connect_ble`'s auto_reconnect takes over for
+    any drop that happens afterwards."""
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -50,34 +58,6 @@ async def _retry(coro_fn, *, attempts: int, delay: float, what: str):
                 await asyncio.sleep(delay)
     raise VagrantNetError(f"{what} failed after {attempts} attempts") from last_error
 
-async def _bluez_force_disconnect(address: str) -> None:
-    # Drop any existing links to the device before tying vNet client
-    try:
-        from dbus_fast import BusType
-        from dbus_fast.aio import MessageBus
-    except ImportError:
-        return
-
-    dev_suffix = "dev_" + address.upper().replace(":", "_")
-    try:
-        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-    except Exception:
-        return
-    try:
-        for adapter in ("hci0", "hci1"):
-            path = f"/org/bluez/{adapter}/{dev_suffix}"
-            try:
-                introspection = await bus.introspect("org.bluez", path)
-                obj = bus.get_proxy_object("org.bluez", path, introspection)
-                device = obj.get_interface("org.bluez.Device1")
-                if not await device.get_connected():
-                    continue
-                await device.call_disconnect()
-            except Exception:
-                continue  # not on this adapter, or already disconnected
-    finally:
-        bus.disconnect()
-
 @dataclass
 class _PendingFetch:
     request_id: int
@@ -88,13 +68,14 @@ class VagrantNetClient:
         self.mc = mc
         self._pending: dict[int, _PendingFetch] = {}
         self.mc.subscribe(EventType.RAW_DATA, self._on_raw_data)
+        self.mc.subscribe(EventType.DISCONNECTED, self._on_disconnected)
 
     @classmethod
     # TODO: Support having vagrantNetClient and MeshCore cli/clients at the same time
     # (Maybe a middleware layer to avoid the /dev/ttyUSBX interface being locked by MeshCore CLI or vagrantNetClient)
     async def connect_serial(cls, port: str, baudrate: int = 115200) -> "VagrantNetClient":
         async def _try() -> MeshCore:
-            mc = await MeshCore.create_serial(port, baudrate)
+            mc = await transport.connect_serial(port, baudrate)
             if mc is None:
                 raise ConnectionError(f"could not connect to MeshCore device at {port}")
             return mc
@@ -109,15 +90,8 @@ class VagrantNetClient:
 
     @classmethod
     async def connect_ble(cls, address: str, pin: str | None = None) -> "VagrantNetClient":
-        # TODO: This connect logic is terrible, works but can be made more resilient to the nature of BLE not being available without any drops.
-        # -------------------- Current status of BLE connection issues --------------------
-        #  1. A previous session that didn't cleanly disconnect leaves BLE link up
-        #     function clears that stale link before each retry recovers it.
-        #  2. After the radio itself restarts, it requires re-pairing with a PIN
-        #     Paired/Bonded from look to work but the device wont answer to the handshake
         async def _try() -> MeshCore:
-            await _bluez_force_disconnect(address)
-            mc = await MeshCore.create_ble(address, pin=pin)
+            mc = await transport.connect_ble(address, pin=pin)
             if mc is None:
                 raise ConnectionError(f"could not connect to MeshCore device at {address}")
             return mc
@@ -138,6 +112,16 @@ class VagrantNetClient:
         # TODO: Check if it's worth doing a flood advert or give an option to the end user
         await mc.commands.send_advert(flood=False)
         return cls(mc)
+
+    async def _on_disconnected(self, event) -> None:
+        # Disconnect if transport.py failed to reconnect
+        payload = event.payload or {}
+        if payload.get("reason") == "manual_disconnect":
+            return  # our own disconnect() call, not a real link drop
+        if payload.get("reconnect_failed") or payload.get("max_attempts_exceeded"):
+            logger.error("connection to radio lost and auto-reconnect gave up: %s", payload)
+        else:
+            logger.info("connection to radio lost, reconnecting: %s", payload)
 
     async def _on_raw_data(self, event) -> None:
         raw_hex = event.payload.get("payload") if isinstance(event.payload, dict) else None
@@ -189,28 +173,35 @@ class VagrantNetClient:
     ) -> Response:
         loop = asyncio.get_event_loop()
         last_error: Exception | None = None
+        deadline = loop.time() + CHUNK_RETRY_DEADLINE_SECONDS
+        attempt = 0
 
-        for attempt in range(MAX_RETRIES_PER_CHUNK + 1):
+        while True:
+            attempt += 1
             fut: "asyncio.Future[Response]" = loop.create_future()
             self._pending[req.request_id] = _PendingFetch(req.request_id, fut)
             try:
                 await self.mc.commands.send_raw_data(req.encode(), path=server_path)
                 resp = await asyncio.wait_for(fut, timeout=CHUNK_TIMEOUT_SECONDS)
                 return resp
-            except asyncio.TimeoutError as e:
+            except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                # ConnectionError/OSError catch for send_raw_data failing
                 last_error = e
                 logger.warning(
-                    "timeout waiting for chunk (request_id=%s, attempt %d/%d)",
+                    "chunk request_id=%s attempt %d failed (%s), retrying...",
                     req.request_id,
-                    attempt + 1,
-                    MAX_RETRIES_PER_CHUNK + 1,
+                    attempt,
+                    type(e).__name__,
                 )
             finally:
                 self._pending.pop(req.request_id, None)
 
-        raise VagrantNetError(
-            f"gave up after {MAX_RETRIES_PER_CHUNK + 1} attempts"
-        ) from last_error
+            if loop.time() >= deadline:
+                raise VagrantNetError(
+                    f"gave up on request_id={req.request_id} after {attempt} attempts "
+                    f"over {CHUNK_RETRY_DEADLINE_SECONDS:.0f}s"
+                ) from last_error
+            await asyncio.sleep(random.uniform(*CHUNK_RETRY_JITTER_SECONDS))
 
     async def fetch(
         self, server_pubkey_hex: str, subcommand: Subcommand, path: str = ""

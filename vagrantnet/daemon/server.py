@@ -9,10 +9,8 @@ import sys
 import zlib
 from pathlib import Path
 
-import serial
 from meshcore import EventType, MeshCore
-
-from ..common import chunking, compress, envelope
+from ..common import chunking, compress, envelope, transport
 from ..common.envelope import Request, Response, StatusCode, Subcommand
 from ..common.safepath import PathTraversalError, resolve_within
 from .config import DaemonConfig
@@ -23,21 +21,6 @@ logger = logging.getLogger("vagrantnet.daemon")
 CONNECT_MAX_ATTEMPTS = 4
 CONNECT_RETRY_DELAY_SECONDS = 3.0
 
-async def _reset_serial_session(port: str) -> None:
-    # Force-drop DTR/RTS on the companion radio's serial port before connecting in case radio is busy/hangs.
-    try:
-        line = serial.Serial(port)
-        line.dtr = True
-        line.rts = True
-        await asyncio.sleep(0.3)
-        line.dtr = False
-        line.rts = False
-        await asyncio.sleep(1.0)
-        line.close()
-        await asyncio.sleep(2.0)
-    except serial.SerialException as exc:
-        logger.warning("could not reset serial session on %s: %s", port, exc)
-
 class VagrantNetDaemon:
     def __init__(self, config: DaemonConfig):
         self.config = config
@@ -47,23 +30,29 @@ class VagrantNetDaemon:
             max_total=config.max_in_flight_transfers_total,
             max_per_client=config.max_in_flight_transfers_per_client,
         )
+        # Set by _on_disconnected once transport.py's auto_reconnect has
+        # exhausted its own attempts -- run_forever() watches this to start
+        # a full reconnect cycle instead of leaving the daemon silently deaf.
+        self._link_down = asyncio.Event()
 
     # ---------------- Hosting lifecycle -----------------------------------------
     async def connect(self) -> None:
         conn = self.config.connection
-        # Retry loop in case radio hw is busy
+        # Retry loop for the initial connect (radio busy/not powered up yet).
         last_error: Exception | None = None
         for attempt in range(1, CONNECT_MAX_ATTEMPTS + 1):
             try:
                 if conn.kind == "serial":
-                    if attempt > 1:
-                        await _reset_serial_session(conn.target)
-                    self.mc = await MeshCore.create_serial(conn.target, conn.baudrate)
+                    self.mc = await transport.connect_serial(
+                        conn.target,
+                        conn.baudrate,
+                        pulse_before_first_connect=attempt > 1,
+                    )
                 elif conn.kind == "tcp":
                     host, port_str = conn.target.split(":")
                     self.mc = await MeshCore.create_tcp(host, int(port_str))
                 elif conn.kind == "ble":
-                    self.mc = await MeshCore.create_ble(conn.target)
+                    self.mc = await transport.connect_ble(conn.target)
                 else:
                     raise ValueError(f"unknown connection kind: {conn.kind!r}")
                 if self.mc is not None:
@@ -90,12 +79,28 @@ class VagrantNetDaemon:
                 "check it's flashed with companion firmware and the port/address "
                 "is correct"
             )
+        self._link_down = asyncio.Event()
         self.mc.subscribe(EventType.RAW_DATA, self._on_raw_data)
+        self.mc.subscribe(EventType.DISCONNECTED, self._on_disconnected)
 
         query_result = await self.mc.commands.send_device_query()
         if query_result.type == EventType.ERROR:
             raise RuntimeError(f"device query failed: {query_result.payload}")
         logger.info("daemon connected as %r", self.config.node_name)
+
+    async def _on_disconnected(self, event) -> None:
+        payload = event.payload or {}
+        if payload.get("reason") == "manual_disconnect":
+            return  # our own disconnect() call, not a real link drop
+        if payload.get("reconnect_failed") or payload.get("max_attempts_exceeded"):
+            logger.error(
+                "link lost and auto-reconnect exhausted its attempts -- "
+                "reconnecting from scratch: %s",
+                payload,
+            )
+            self._link_down.set()
+        else:
+            logger.info("link lost, auto-reconnect in progress: %s", payload)
 
     async def disconnect(self) -> None:
         if self.mc is not None:
@@ -103,15 +108,26 @@ class VagrantNetDaemon:
             self.mc = None
 
     async def run_forever(self) -> None:
-        await self.connect()
-
         loop = asyncio.get_running_loop()
         stop = asyncio.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
             # Ensure that when daemon is killed, DTR/RTS is dropped and cleaned
             loop.add_signal_handler(sig, stop.set)
 
-        await stop.wait()
+        while not stop.is_set():
+            await self.connect()
+            stop_task = asyncio.ensure_future(stop.wait())
+            link_down_task = asyncio.ensure_future(self._link_down.wait())
+            _, pending = await asyncio.wait(
+                [stop_task, link_down_task], return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            if stop.is_set():
+                break
+            # auto_reconnect gave up, no transport path
+            await self.disconnect()
+
         logger.info("shutting down")
         await self.disconnect()
 

@@ -6,6 +6,5 @@ venv/
 config.json
 config*.json
 !config.example.json
-master-protocol-spec*
-NOTES*
+des
 *egg-info*

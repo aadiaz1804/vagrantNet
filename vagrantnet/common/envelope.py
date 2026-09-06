@@ -9,10 +9,9 @@ from enum import IntEnum
 PROTO_MARKER = 0b01  # top 2 bits of ctrl byte; soft sanity check, not crypto
 VERSION = 1
 
-# TODO: See if protocol can be reduced to 184 bytes (firmware limit) by using a 1-byte request_id and 1-byte content_token, instead of 2-byte request_id and 2-byte content_token.
-#(2026-09-05): a 163-byte reply delivered reliably, a 178-byte reply dropped on the way to the client most times with no errors
-# set arbitrary 150 while on alpha until testing more what are the hard limits of transmit
-MAX_SAFE_PAYLOAD = 150
+# TODO: shrink request_id from 2 bytes to 1 to claw back header room
+# (content_token is already 1 byte). Low priority
+MAX_SAFE_PAYLOAD = 160 # Max verified payload size for a single CMD_SEND_RAW_DATA
 PUB_KEY_PREFIX_LEN = 6
 PUB_KEY_SIZE = 32  # full key, used only off-wire for contact lookup
 
