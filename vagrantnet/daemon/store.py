@@ -1,7 +1,6 @@
 """In-memory transfer state for the chunk-continuation (CONTINUE) scheme."""
 
 from __future__ import annotations
-
 import time
 from dataclasses import dataclass, field
 
@@ -11,6 +10,7 @@ class NoTokenAvailable(RuntimeError):
 @dataclass
 class Transfer:
     client_pubkey_prefix: bytes
+    request_id: int  # the GET_PAGE/GET_FILE request that started this transfer
     chunks: list[bytes]  # already compressed + chunked, ready to send as-is
     uncompressed_size: int
     compressed: bool
@@ -61,6 +61,17 @@ class TransferStore:
     def get(self, token: int) -> Transfer | None:
         self._sweep_expired()
         return self._by_token.get(token)
+
+    def find_by_request(self, client_pubkey_prefix: bytes, request_id: int) -> tuple[int, Transfer] | None:
+        # See if a client did a retry, get the existing token and continue the transfer instead of starting a new one.
+        self._sweep_expired()
+        for token, transfer in self._by_token.items():
+            if (
+                transfer.client_pubkey_prefix == client_pubkey_prefix
+                and transfer.request_id == request_id
+            ):
+                return token, transfer
+        return None
 
     def finish(self, token: int) -> None:
         self._by_token.pop(token, None)

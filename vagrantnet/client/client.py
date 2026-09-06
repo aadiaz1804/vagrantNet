@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import sys
 import zlib
 from dataclasses import dataclass
@@ -25,9 +26,57 @@ logger = logging.getLogger("vagrantnet.client")
 
 CHUNK_TIMEOUT_SECONDS = 15.0
 MAX_RETRIES_PER_CHUNK = 2
+CONNECT_MAX_ATTEMPTS = 4
+CONNECT_RETRY_DELAY_SECONDS = 3.0
+CONTACT_LOOKUP_MAX_ATTEMPTS = 8
+CONTACT_LOOKUP_RETRY_DELAY_SECONDS = 3.0
+
+_BLE_ADDRESS_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 
 class VagrantNetError(RuntimeError):
     pass
+
+async def _retry(coro_fn, *, attempts: int, delay: float, what: str):
+    # TODO: Make this more resilient to LoRa link drops, it should be seamless like a TCP connection up until the timeout.
+    # For now this is a simple retry
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await coro_fn()
+        except (ConnectionError, OSError) as exc:
+            last_error = exc
+            logger.warning("%s attempt %d/%d failed: %s", what, attempt, attempts, exc)
+            if attempt < attempts:
+                await asyncio.sleep(delay)
+    raise VagrantNetError(f"{what} failed after {attempts} attempts") from last_error
+
+async def _bluez_force_disconnect(address: str) -> None:
+    # Drop any existing links to the device before tying vNet client
+    try:
+        from dbus_fast import BusType
+        from dbus_fast.aio import MessageBus
+    except ImportError:
+        return
+
+    dev_suffix = "dev_" + address.upper().replace(":", "_")
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    except Exception:
+        return
+    try:
+        for adapter in ("hci0", "hci1"):
+            path = f"/org/bluez/{adapter}/{dev_suffix}"
+            try:
+                introspection = await bus.introspect("org.bluez", path)
+                obj = bus.get_proxy_object("org.bluez", path, introspection)
+                device = obj.get_interface("org.bluez.Device1")
+                if not await device.get_connected():
+                    continue
+                await device.call_disconnect()
+            except Exception:
+                continue  # not on this adapter, or already disconnected
+    finally:
+        bus.disconnect()
 
 @dataclass
 class _PendingFetch:
@@ -41,39 +90,93 @@ class VagrantNetClient:
         self.mc.subscribe(EventType.RAW_DATA, self._on_raw_data)
 
     @classmethod
-    # TODO: support BLE connections too + Support having vagrantNetClient and MeshCore cli/clients at the same time
+    # TODO: Support having vagrantNetClient and MeshCore cli/clients at the same time
     # (Maybe a middleware layer to avoid the /dev/ttyUSBX interface being locked by MeshCore CLI or vagrantNetClient)
     async def connect_serial(cls, port: str, baudrate: int = 115200) -> "VagrantNetClient":
-        mc = await MeshCore.create_serial(port, baudrate)
-        if mc is None:
-            raise VagrantNetError(f"could not connect to MeshCore device at {port}")
+        async def _try() -> MeshCore:
+            mc = await MeshCore.create_serial(port, baudrate)
+            if mc is None:
+                raise ConnectionError(f"could not connect to MeshCore device at {port}")
+            return mc
+
+        mc = await _retry(
+            _try,
+            attempts=CONNECT_MAX_ATTEMPTS,
+            delay=CONNECT_RETRY_DELAY_SECONDS,
+            what=f"connect to {port}",
+        )
+        return await cls._ready(mc)
+
+    @classmethod
+    async def connect_ble(cls, address: str, pin: str | None = None) -> "VagrantNetClient":
+        # TODO: This connect logic is terrible, works but can be made more resilient to the nature of BLE not being available without any drops.
+        # -------------------- Current status of BLE connection issues --------------------
+        #  1. A previous session that didn't cleanly disconnect leaves BLE link up
+        #     function clears that stale link before each retry recovers it.
+        #  2. After the radio itself restarts, it requires re-pairing with a PIN
+        #     Paired/Bonded from look to work but the device wont answer to the handshake
+        async def _try() -> MeshCore:
+            await _bluez_force_disconnect(address)
+            mc = await MeshCore.create_ble(address, pin=pin)
+            if mc is None:
+                raise ConnectionError(f"could not connect to MeshCore device at {address}")
+            return mc
+
+        mc = await _retry(
+            _try,
+            attempts=CONNECT_MAX_ATTEMPTS,
+            delay=CONNECT_RETRY_DELAY_SECONDS,
+            what=f"connect to {address}",
+        )
+        return await cls._ready(mc)
+
+    @classmethod
+    async def _ready(cls, mc: MeshCore) -> "VagrantNetClient":
+        # No bulk contacts sync for speed, after radio is ready we only ask for the one contact we need for the server's pk.
+        await mc.commands.send_device_query()
+        # Do a quick advert without flood to get near repeaters
+        # TODO: Check if it's worth doing a flood advert or give an option to the end user
+        await mc.commands.send_advert(flood=False)
         return cls(mc)
 
     async def _on_raw_data(self, event) -> None:
         raw_hex = event.payload.get("payload") if isinstance(event.payload, dict) else None
         if not raw_hex:
             return
+        logger.info("RAW_DATA event received: %s", event.payload)
         try:
             resp = Response.decode(bytes.fromhex(raw_hex))
-        except EnvelopeError:
-            return  # not a recognized frame -- ignore
+        except EnvelopeError as e:
+            logger.warning("RAW_DATA received but failed to decode as a Response: %s (raw=%s)", e, raw_hex)
+            return  # ignored bad/unexpected response
 
         pending = self._pending.get(resp.request_id)
         if pending is not None and not pending.future.done():
             pending.future.set_result(resp)
 
     async def _resolve_path(self, server_pubkey_hex: str) -> bytes:
-        contact = self.mc.get_contact_by_key_prefix(server_pubkey_hex)
-        if contact is None:
-            raise VagrantNetError(
-                f"Server {server_pubkey_hex[:12]}... is not a known contact yet "
-                " wait for server/repeater advert before fetching"
+        pubkey = bytes.fromhex(server_pubkey_hex)
+        contact: dict = {}
+        for attempt in range(1, CONTACT_LOOKUP_MAX_ATTEMPTS + 1):
+            contact_event = await self.mc.commands.get_contact_by_key(pubkey)
+            contact = getattr(contact_event, "payload", None) or {}
+            if contact_event.type != EventType.ERROR and contact.get("out_path_len", -1) >= 0:
+                break
+            logger.warning(
+                "contact/path lookup attempt %d/%d for %s came back empty: %s",
+                attempt,
+                CONTACT_LOOKUP_MAX_ATTEMPTS,
+                server_pubkey_hex[:12],
+                getattr(contact_event, "payload", None),
             )
-        path_event = await self.mc.commands.get_advert_path(contact["public_key"])
-        path_info = getattr(path_event, "payload", None) or {}
-        if path_info.get("path_len", -1) < 0 or not path_info.get("path"):
-            raise VagrantNetError(f"no known path was found for {server_pubkey_hex[:12]}")
-        return bytes.fromhex(path_info["path"])
+            if attempt < CONTACT_LOOKUP_MAX_ATTEMPTS:
+                await asyncio.sleep(CONTACT_LOOKUP_RETRY_DELAY_SECONDS)
+        else:
+            raise VagrantNetError(
+                f"Server {server_pubkey_hex[:12]}... has no known path yet -- "
+                "wait for a server/repeater advert before fetching"
+            )
+        return bytes.fromhex(contact.get("out_path") or "")
 
     def _own_pubkey_prefix(self) -> bytes:
         pk_hex = self.mc.self_info.get("public_key")
@@ -178,16 +281,26 @@ class VagrantNetClient:
 
 async def _main(argv: list[str]) -> None:
     logging.basicConfig(level=logging.INFO)
-    if len(argv) < 4:
+
+    # Pull an optional BLE --pin=XXXXXX if it's the first connection
+    pin: str | None = None
+    positional = []
+    for arg in argv[1:]:
+        if arg.startswith("--pin="):
+            pin = arg.split("=", 1)[1]
+        else:
+            positional.append(arg)
+
+    if len(positional) < 3:
         print(
             # TODO: Make this a TUI browser-style interface, with a list of known/favorite and their pages, and a way to select and fetch them.
-            "usage: python -m vagrantnet.client.client <serial-port> <server-pubkey-hex> "
-            "<get-page|get-file|list-pages> [path]"
+            "usage: python -m vagrantnet.client.client <serial-port|ble-address> "
+            "<server-pubkey-hex> <get-page|get-file|list-pages> [path] [--pin=XXXXXX]"
         )
         sys.exit(1)
 
-    port, server_key, cmd_str = argv[1], argv[2], argv[3]
-    path = argv[4] if len(argv) > 4 else ""
+    port, server_key, cmd_str = positional[0], positional[1], positional[2]
+    path = positional[3] if len(positional) > 3 else ""
 
     subcommand = {
         "get-page": Subcommand.GET_PAGE,
@@ -198,16 +311,24 @@ async def _main(argv: list[str]) -> None:
         print(f"unknown command: {cmd_str}")
         sys.exit(1)
 
-    client = await VagrantNetClient.connect_serial(port)
-    body = await client.fetch(server_key, subcommand, path)
+    client = (
+        await VagrantNetClient.connect_ble(port, pin=pin)
+        if _BLE_ADDRESS_RE.match(port)
+        else await VagrantNetClient.connect_serial(port)
+    )
+    try:
+        body = await client.fetch(server_key, subcommand, path)
 
-    if subcommand == Subcommand.GET_FILE:
-        out_name = path.split("/")[-1] or "download.bin"
-        with open(out_name, "wb") as f:
-            f.write(body)
-        print(f"saved {len(body)} bytes to {out_name}")
-    else:
-        print(render_ansi(body.decode("utf-8", errors="replace")))
+        if subcommand == Subcommand.GET_FILE:
+            out_name = path.split("/")[-1] or "download.bin"
+            with open(out_name, "wb") as f:
+                f.write(body)
+            print(f"saved {len(body)} bytes to {out_name}")
+        else:
+            print(render_ansi(body.decode("utf-8", errors="replace")))
+    finally:
+        # Cleanly disconnect from the radio before exiting
+        await client.mc.disconnect()
 
 if __name__ == "__main__":
     asyncio.run(_main(sys.argv))

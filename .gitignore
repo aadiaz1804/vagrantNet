@@ -8,4 +8,4 @@ config*.json
 !config.example.json
 master-protocol-spec*
 NOTES*
-
+*egg-info*
