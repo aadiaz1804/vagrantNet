@@ -50,7 +50,7 @@ class Shell:
     # ---------------- connection -----------------------------------------
     async def connect(self, target: str, pin: str | None = None) -> None:
         if self.client is not None:
-            await self.client.mc.disconnect()
+            await self.client.disconnect()
             self.client = None
 
         kind = "ble" if _BLE_ADDRESS_RE.match(target) else "serial"
@@ -255,7 +255,7 @@ class Shell:
 
     async def shutdown(self) -> None:
         if self.client is not None:
-            await self.client.mc.disconnect()
+            await self.client.disconnect()
 
 def _completer() -> NestedCompleter:
     return NestedCompleter.from_nested_dict(
@@ -275,7 +275,8 @@ def _completer() -> NestedCompleter:
     )
 
 async def main() -> None:
-    logging.basicConfig(level=logging.WARNING)  # keep the shell's own output clean
+    # force=True to not get library's INFO logging
+    logging.basicConfig(level=logging.WARNING, force=True)
     shell = Shell()
     HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     session: PromptSession = PromptSession(
@@ -297,10 +298,7 @@ async def main() -> None:
                     if not await shell.run_command(line):
                         break
                 except Exception:
-                    # A bug in one command, or an unexpected error surfacing
-                    # from the client (something VagrantNetError didn't
-                    # wrap), shouldn't take the whole session down --
-                    # "seamless" includes the shell itself staying up.
+                    # Catch possible bugs without killing the shell
                     logger.exception("command failed: %r", line)
                     print("that command hit an unexpected error -- see log for details")
     finally:

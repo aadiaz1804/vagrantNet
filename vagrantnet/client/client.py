@@ -32,6 +32,9 @@ CONNECT_MAX_ATTEMPTS = 4
 CONNECT_RETRY_DELAY_SECONDS = 3.0
 CONTACT_LOOKUP_MAX_ATTEMPTS = 8
 CONTACT_LOOKUP_RETRY_DELAY_SECONDS = 3.0
+HEARTBEAT_INTERVAL_SECONDS = 60.0
+HEARTBEAT_TIMEOUT_SECONDS = 15.0
+RECONNECT_BACKOFF_MAX_SECONDS = 60.0
 
 _BLE_ADDRESS_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 
@@ -44,12 +47,47 @@ async def _retry(coro_fn, *, attempts: int, delay: float, what: str):
     for attempt in range(1, attempts + 1):
         try:
             return await coro_fn(attempt)
-        except (ConnectionError, OSError) as exc:
+        except VagrantNetError:
+            raise  # already transmitted and done
+        except Exception as exc:
+            # Broad as BLE connect errors are plain Exceptions 
             last_error = exc
-            logger.warning("%s attempt %d/%d failed: %s", what, attempt, attempts, exc)
+            logger.warning(
+                "%s attempt %d/%d failed: %s: %s",
+                what, attempt, attempts, type(exc).__name__, exc,
+            )
             if attempt < attempts:
                 await asyncio.sleep(delay)
     raise VagrantNetError(f"{what} failed after {attempts} attempts") from last_error
+
+@dataclass
+class _Dial:
+    # Classes needed to reconnect after a link drop reliably
+    kind: str  # "serial" or "ble"
+    target: str
+    baudrate: int = 115200
+    pin: str | None = None
+
+async def _dial(d: _Dial) -> MeshCore:
+    async def _try(attempt: int) -> MeshCore:
+        if d.kind == "ble":
+            mc = await transport.connect_ble(
+                d.target, pin=d.pin, force_disconnect_before_first_connect=attempt == 1
+            )
+        else:
+            mc = await transport.connect_serial(
+                d.target, d.baudrate, pulse_before_first_connect=attempt > 1
+            )
+        if mc is None:
+            raise ConnectionError(f"could not connect to MeshCore device at {d.target}")
+        return mc
+
+    return await _retry(
+        _try,
+        attempts=CONNECT_MAX_ATTEMPTS,
+        delay=CONNECT_RETRY_DELAY_SECONDS,
+        what=f"connect to {d.target}",
+    )
 
 @dataclass
 class _PendingFetch:
@@ -57,9 +95,15 @@ class _PendingFetch:
     future: "asyncio.Future[Response]"
 
 class VagrantNetClient:
-    def __init__(self, mc: MeshCore):
+    def __init__(self, mc: MeshCore, dial: _Dial | None = None):
         self.mc = mc
+        self.dial = dial
         self._pending: dict[int, _PendingFetch] = {}
+        self._link_down = asyncio.Event()
+        self._supervisor: asyncio.Task | None = None
+        self._subscribe()
+
+    def _subscribe(self) -> None:
         self.mc.subscribe(EventType.RAW_DATA, self._on_raw_data)
         self.mc.subscribe(EventType.DISCONNECTED, self._on_disconnected)
 
@@ -67,58 +111,92 @@ class VagrantNetClient:
     # TODO: Support having vagrantNetClient and MeshCore cli/clients at the same time
     # (Maybe a middleware layer to avoid the /dev/ttyUSBX interface being locked by MeshCore CLI or vagrantNetClient)
     async def connect_serial(cls, port: str, baudrate: int = 115200) -> "VagrantNetClient":
-        async def _try(attempt: int) -> MeshCore:
-            mc = await transport.connect_serial(
-                port, baudrate, pulse_before_first_connect=attempt > 1
-            )
-            if mc is None:
-                raise ConnectionError(f"could not connect to MeshCore device at {port}")
-            return mc
-
-        mc = await _retry(
-            _try,
-            attempts=CONNECT_MAX_ATTEMPTS,
-            delay=CONNECT_RETRY_DELAY_SECONDS,
-            what=f"connect to {port}",
-        )
-        return await cls._ready(mc)
+        dial = _Dial("serial", port, baudrate=baudrate)
+        return await cls._ready(await _dial(dial), dial)
 
     @classmethod
     async def connect_ble(cls, address: str, pin: str | None = None) -> "VagrantNetClient":
-        async def _try(attempt: int) -> MeshCore:
-            mc = await transport.connect_ble(
-                address, pin=pin, force_disconnect_before_first_connect=attempt == 1
-            )
-            if mc is None:
-                raise ConnectionError(f"could not connect to MeshCore device at {address}")
-            return mc
-
-        mc = await _retry(
-            _try,
-            attempts=CONNECT_MAX_ATTEMPTS,
-            delay=CONNECT_RETRY_DELAY_SECONDS,
-            what=f"connect to {address}",
-        )
-        return await cls._ready(mc)
+        dial = _Dial("ble", address, pin=pin)
+        return await cls._ready(await _dial(dial), dial)
 
     @classmethod
-    async def _ready(cls, mc: MeshCore) -> "VagrantNetClient":
+    async def _ready(cls, mc: MeshCore, dial: _Dial | None = None) -> "VagrantNetClient":
         # No bulk contacts sync for speed, after radio is ready we only ask for the one contact we need for the server's pk.
         await mc.commands.send_device_query()
         # Do a quick advert without flood to get near repeaters
         # TODO: Check if it's worth doing a flood advert or give an option to the end user
         await mc.commands.send_advert(flood=False)
-        return cls(mc)
+        client = cls(mc, dial)
+        if dial is not None:
+            client._supervisor = asyncio.ensure_future(client._supervise())
+        return client
 
     async def _on_disconnected(self, event) -> None:
-        # Disconnect if transport.py failed to reconnect
         payload = event.payload or {}
         if payload.get("reason") == "manual_disconnect":
             return  # our own disconnect() call, not a real link drop
         if payload.get("reconnect_failed") or payload.get("max_attempts_exceeded"):
             logger.error("connection to radio lost and auto-reconnect gave up: %s", payload)
+            self._link_down.set()
         else:
             logger.info("connection to radio lost, reconnecting: %s", payload)
+
+    async def _heartbeat_loop(self) -> None:
+        # Changed the passive send and verify to an active query to the radio hardware
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            logger.info("heartbeat: querying radio")
+            try:
+                result = await asyncio.wait_for(
+                    self.mc.commands.send_device_query(),
+                    timeout=HEARTBEAT_TIMEOUT_SECONDS,
+                )
+                if result is None or result.type == EventType.ERROR:
+                    raise ConnectionError(f"heartbeat query failed: {result}")
+            except Exception as exc:
+                logger.error("heartbeat failed, treating link as down: %s", exc)
+                self._link_down.set()
+                return
+
+    async def _supervise(self) -> None:
+        # Client-side of the run_forever() implementatinon
+        backoff = CONNECT_RETRY_DELAY_SECONDS
+        while True:
+            heartbeat = asyncio.ensure_future(self._heartbeat_loop())
+            try:
+                await self._link_down.wait()
+            finally:
+                heartbeat.cancel()
+            logger.warning("radio link down, reconnecting")
+            try:
+                await self._redial()
+            except Exception as exc:
+                logger.error("reconnect failed, retrying in %.0fs: %s", backoff, exc)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX_SECONDS)
+                continue
+            backoff = CONNECT_RETRY_DELAY_SECONDS
+            logger.info("radio link restored")
+
+    async def _redial(self) -> None:
+        assert self.dial is not None
+        try:
+            await self.mc.disconnect()
+        except Exception as exc:
+            # Old link is dead reset failed.
+            logger.debug("teardown of the dead link failed: %s", exc)
+        mc = await _dial(self.dial)
+        await mc.commands.send_device_query()
+        self.mc = mc
+        self._link_down = asyncio.Event()
+        self._subscribe()
+
+    async def disconnect(self) -> None:
+        # Stop active heartbeat then disconnect link
+        if self._supervisor is not None:
+            self._supervisor.cancel()
+            self._supervisor = None
+        await self.mc.disconnect()
 
     async def _on_raw_data(self, event) -> None:
         raw_hex = event.payload.get("payload") if isinstance(event.payload, dict) else None
@@ -178,17 +256,23 @@ class VagrantNetClient:
             fut: "asyncio.Future[Response]" = loop.create_future()
             self._pending[req.request_id] = _PendingFetch(req.request_id, fut)
             try:
+                logger.info(
+                    "send_raw_data: request_id=%s attempt %d", req.request_id, attempt
+                )
                 await self.mc.commands.send_raw_data(req.encode(), path=server_path)
                 resp = await asyncio.wait_for(fut, timeout=CHUNK_TIMEOUT_SECONDS)
                 return resp
-            except (asyncio.TimeoutError, ConnectionError, OSError) as e:
-                # ConnectionError/OSError catch for send_raw_data failing
+            except EnvelopeError:
+                raise  # unencodable frame
+            except Exception as e:
+                # Retry fetch if send/recieve fails
                 last_error = e
                 logger.warning(
-                    "chunk request_id=%s attempt %d failed (%s), retrying...",
+                    "chunk request_id=%s attempt %d failed (%s: %s), retrying...",
                     req.request_id,
                     attempt,
                     type(e).__name__,
+                    e,
                 )
             finally:
                 self._pending.pop(req.request_id, None)
@@ -267,8 +351,13 @@ class VagrantNetClient:
 
         return body
 
+LOG_FORMAT = "%(asctime)s.%(msecs)03d %(name)s %(levelname)s %(message)s"
+LOG_DATEFMT = "%H:%M:%S"
+
 async def _main(argv: list[str]) -> None:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATEFMT, force=True
+    )
 
     # Pull an optional BLE --pin=XXXXXX if it's the first connection
     pin: str | None = None
@@ -320,7 +409,7 @@ async def _main(argv: list[str]) -> None:
             print(render_ansi(body.decode("utf-8", errors="replace")))
     finally:
         # Cleanly disconnect from the radio before exiting
-        await client.mc.disconnect()
+        await client.disconnect()
 
 if __name__ == "__main__":
     asyncio.run(_main(sys.argv))

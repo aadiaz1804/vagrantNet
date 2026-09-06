@@ -64,6 +64,48 @@ async def _bluez_force_disconnect(address: str) -> None:
     finally:
         bus.disconnect()
 
+async def _bluez_known_device(address: str):
+    """Return a bleak BLEDevice for an already-bonded address, or None.
+
+    BlueZ only announces a device through InterfacesAdded when it first
+    discovers it. A bonded radio is already in BlueZ's object tree, so it is
+    never re-announced -- and bleak's address-string lookup sits waiting for
+    that event until it times out with BleakDeviceNotFoundError, even while
+    the radio is advertising happily. Handing bleak the existing object
+    instead skips discovery altogether (observed 2026-09-06: 30s timeout and
+    four failed attempts by address, 1.2s by path).
+    """
+    try:
+        from bleak.backends.device import BLEDevice
+        from dbus_fast import BusType
+        from dbus_fast.aio import MessageBus
+    except ImportError:
+        return None
+
+    suffix = "dev_" + address.upper().replace(":", "_")
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    except Exception:
+        return None
+    try:
+        introspection = await bus.introspect("org.bluez", "/")
+        obj = bus.get_proxy_object("org.bluez", "/", introspection)
+        manager = obj.get_interface("org.freedesktop.DBus.ObjectManager")
+        for path, interfaces in (await manager.call_get_managed_objects()).items():
+            if not path.endswith(suffix):
+                continue
+            props = interfaces.get("org.bluez.Device1")
+            if props is None:
+                continue
+            plain = {k: v.value for k, v in props.items()}
+            logger.debug("using BlueZ device object %s for %s", path, address)
+            return BLEDevice(address, plain.get("Name"), {"path": path, "props": plain})
+    except Exception as exc:
+        logger.debug("BlueZ device lookup for %s failed: %s", address, exc)
+    finally:
+        bus.disconnect()
+    return None
+
 class _ResilientSerialConnection(SerialConnection):
     # SerialConnection that pulses DTR/RTS before every connect after the first
 
@@ -80,32 +122,26 @@ class _ResilientSerialConnection(SerialConnection):
         return result
 
 class _ResilientBLEConnection(BLEConnection):
-    """BLEConnection that clears a stale BlueZ link on its first connect
-    only, not on every retry.
-
-    Calling _bluez_force_disconnect unconditionally on every attempt means
-    every outer retry *and* every future auto_reconnect cycle issues a
-    D-Bus disconnect RPC against the adapter -- across a real retry
-    sequence that's dozens of disconnect calls against a device we've
-    never actually connected to yet, the exact "keep touching the
-    hardware" pattern that destabilizes BLE on this machine (observed
-    2026-09-06: a 20-attempt retry loop with this unconditional call never
-    connected once). The stale-link case this exists for is a leftover
-    session from *before this process started* -- checking for it once,
-    on the first attempt, covers that; repeating the check on every retry
-    within the same run doesn't, since nothing new can connect to the
-    device between our own attempts.
-    """
-
+    #BLEConnection that clears a stale BlueZ link on its first connect not on retry.
     def __init__(self, *args, force_disconnect_before_first_connect: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
         self._pending_force_disconnect = force_disconnect_before_first_connect
 
     async def connect(self):
-        if self._pending_force_disconnect and self.address:
+        if self._pending_force_disconnect and isinstance(self.address, str):
             await _bluez_force_disconnect(self.address)
         self._pending_force_disconnect = False
+        if self.device is None and isinstance(self.address, str):
+            # BLEConnection.connect() uses `device` verbatim when set
+            self.device = await _bluez_known_device(self.address)
         return await super().connect()
+
+async def _close_quietly(mc: MeshCore) -> None:
+    # Failed connect/cleanup 
+    try:
+        await mc.disconnect()
+    except Exception as exc:
+        logger.debug("cleanup disconnect failed: %s", exc)
 
 async def connect_serial(
     port: str,
@@ -125,9 +161,14 @@ async def connect_serial(
         auto_reconnect=auto_reconnect,
         max_reconnect_attempts=max_reconnect_attempts,
     )
-    result = await mc.connect()
+    try:
+        result = await mc.connect()
+    except Exception:
+        # A raised connect leaves the tty open
+        await _close_quietly(mc)
+        raise
     if result is None:
-        await mc.disconnect()
+        await _close_quietly(mc)
         return None
     return mc
 
@@ -150,8 +191,13 @@ async def connect_ble(
         auto_reconnect=auto_reconnect,
         max_reconnect_attempts=max_reconnect_attempts,
     )
-    result = await mc.connect()
+    try:
+        result = await mc.connect()
+    except Exception:
+        # Same leak as the serial path
+        await _close_quietly(mc)
+        raise
     if result is None:
-        await mc.disconnect()
+        await _close_quietly(mc)
         return None
     return mc

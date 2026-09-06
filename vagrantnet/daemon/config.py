@@ -25,6 +25,7 @@ class DaemonConfig:
     max_in_flight_transfers_per_client: int = 2
     max_in_flight_transfers_total: int = 8
     content_token_ttl_seconds: int = 300
+    content_token_linger_seconds: int = 60 # How long a finished transfer stays fetchable
 
     @staticmethod
     def load(path: Path) -> "DaemonConfig":
@@ -46,4 +47,5 @@ class DaemonConfig:
             ),
             max_in_flight_transfers_total=raw.get("max_in_flight_transfers_total", 8),
             content_token_ttl_seconds=raw.get("content_token_ttl_seconds", 300),
+            content_token_linger_seconds=raw.get("content_token_linger_seconds", 60),
         )

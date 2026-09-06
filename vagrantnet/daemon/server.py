@@ -6,6 +6,7 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 import zlib
 from pathlib import Path
 
@@ -18,8 +19,12 @@ from .store import NoTokenAvailable, Transfer, TransferStore
 
 logger = logging.getLogger("vagrantnet.daemon")
 
+LOG_FORMAT = "%(asctime)s.%(msecs)03d %(name)s %(levelname)s %(message)s"
+LOG_DATEFMT = "%H:%M:%S"
+
 CONNECT_MAX_ATTEMPTS = 4
 CONNECT_RETRY_DELAY_SECONDS = 3.0
+CONNECT_BACKOFF_MAX_SECONDS = 60.0
 HEARTBEAT_INTERVAL_SECONDS = 60.0
 HEARTBEAT_TIMEOUT_SECONDS = 15.0
 
@@ -31,17 +36,17 @@ class VagrantNetDaemon:
         config.downloads_dir.mkdir(parents=True, exist_ok=True)
         self.store = TransferStore(
             ttl_seconds=config.content_token_ttl_seconds,
+            linger_seconds=config.content_token_linger_seconds,
             max_total=config.max_in_flight_transfers_total,
             max_per_client=config.max_in_flight_transfers_per_client,
         )
-        # Set by _on_disconnected once transport.py's auto_reconnect has
-        # exhausted its own attempts -- run_forever() watches this to start
-        # a full reconnect cycle instead of leaving the daemon silently deaf.
         self._link_down = asyncio.Event()
 
     # ---------------- Hosting lifecycle -----------------------------------------
     async def connect(self) -> None:
         conn = self.config.connection
+        if conn.kind not in ("serial", "tcp", "ble"):
+            raise ValueError(f"unknown connection kind: {conn.kind!r}")
         # Retry loop for the initial connect (radio busy/not powered up yet).
         last_error: Exception | None = None
         for attempt in range(1, CONNECT_MAX_ATTEMPTS + 1):
@@ -55,18 +60,16 @@ class VagrantNetDaemon:
                 elif conn.kind == "tcp":
                     host, port_str = conn.target.split(":")
                     self.mc = await MeshCore.create_tcp(host, int(port_str))
-                elif conn.kind == "ble":
+                else:
                     self.mc = await transport.connect_ble(
                         conn.target,
                         force_disconnect_before_first_connect=attempt == 1,
                     )
-                else:
-                    raise ValueError(f"unknown connection kind: {conn.kind!r}")
                 if self.mc is not None:
                     break
                 last_error = None
-            except (ConnectionError, OSError) as exc:
-                # expected serialException if the radio is busy and reconnect fails
+            except Exception as exc:
+                # Server transport retry
                 last_error = exc
             logger.warning(
                 "connect attempt %d/%d to %s:%s failed%s",
@@ -74,7 +77,7 @@ class VagrantNetDaemon:
                 CONNECT_MAX_ATTEMPTS,
                 conn.kind,
                 conn.target,
-                f": {last_error}" if last_error else "",
+                f": {type(last_error).__name__}: {last_error}" if last_error else "",
             )
             if attempt < CONNECT_MAX_ATTEMPTS:
                 await asyncio.sleep(CONNECT_RETRY_DELAY_SECONDS)
@@ -114,6 +117,7 @@ class VagrantNetDaemon:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
             if self.mc is None:
                 return
+            logger.info("heartbeat: querying radio")
             try:
                 result = await asyncio.wait_for(
                     self.mc.commands.send_device_query(),
@@ -138,8 +142,23 @@ class VagrantNetDaemon:
             # Ensure that when daemon is killed, DTR/RTS is dropped and cleaned
             loop.add_signal_handler(sig, stop.set)
 
+        backoff = CONNECT_RETRY_DELAY_SECONDS
         while not stop.is_set():
-            await self.connect()
+            try:
+                await self.connect()
+            except ValueError:
+                raise  # misconfigured. Exit
+            except Exception as exc:
+                # A radio that's unplugged for longer than one connect cycle
+                logger.error("connect cycle failed, retrying in %.0fs: %s", backoff, exc)
+                await self.disconnect()
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * 2, CONNECT_BACKOFF_MAX_SECONDS)
+                continue
+            backoff = CONNECT_RETRY_DELAY_SECONDS
             stop_task = asyncio.ensure_future(stop.wait())
             link_down_task = asyncio.ensure_future(self._link_down.wait())
             heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
@@ -197,7 +216,23 @@ class VagrantNetDaemon:
         payload = compressed if use_compressed else uncompressed
 
         chunks = chunking.split(payload)
-        checksum = zlib.crc32(uncompressed) if len(chunks) else None
+        if (
+            len(chunks) > envelope.MAX_TOTAL_CHUNKS
+            or len(uncompressed) > envelope.MAX_UNCOMPRESSED_SIZE
+        ):
+            logger.warning(
+                "refusing %r: %d bytes in %d chunks, past what the header can "
+                "describe (%d bytes / %d chunks)",
+                req.path,
+                len(uncompressed),
+                len(chunks),
+                envelope.MAX_UNCOMPRESSED_SIZE,
+                envelope.MAX_TOTAL_CHUNKS,
+            )
+            await self._reply_error(req, StatusCode.ERROR)
+            return
+
+        checksum = zlib.crc32(uncompressed)
 
         if len(chunks) == 1:
             await self._send_chunk(
@@ -337,10 +372,17 @@ class VagrantNetDaemon:
             total_chunks=total_chunks if chunk_number == 0 else None,
         )
 
-        # This is a single-hop test
         # TODO: Increase robustness of the send tuned for multiple hops, clients and repeaters.
         payload = resp.encode()
+        logger.info(
+            "send_raw_data: request %s chunk %d (%d bytes)",
+            req.request_id,
+            chunk_number,
+            len(payload),
+        )
+        started = time.monotonic()
         send_result = await self.mc.commands.send_raw_data(payload)
+        elapsed = time.monotonic() - started
         if send_result.type == EventType.ERROR:
             logger.warning(
                 "send_raw_data failed for request %s chunk %d: %s",
@@ -350,16 +392,22 @@ class VagrantNetDaemon:
             )
         else:
             logger.info(
-                "sent reply for request %s chunk %d (%d bytes, status=%s)",
+                "sent reply for request %s chunk %d (%d bytes, status=%s) in %.3fs",
                 req.request_id,
                 chunk_number,
                 len(payload),
                 status.name,
+                elapsed,
             )
 
 
 async def _main(config_path: str) -> None:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format=LOG_FORMAT,
+        datefmt=LOG_DATEFMT,
+        force=True,
+    )
     config = DaemonConfig.load(Path(config_path))
     daemon = VagrantNetDaemon(config)
     await daemon.run_forever()

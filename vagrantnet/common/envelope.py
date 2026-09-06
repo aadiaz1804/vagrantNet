@@ -12,6 +12,8 @@ VERSION = 1
 # TODO: shrink request_id from 2 bytes to 1 to claw back header room
 # (content_token is already 1 byte). Low priority
 MAX_SAFE_PAYLOAD = 160 # Max verified payload size for a single CMD_SEND_RAW_DATA
+MAX_TOTAL_CHUNKS = 0xFF        # total_chunks is one byte
+MAX_UNCOMPRESSED_SIZE = 0xFFFF  # uncompressed_size is two bytes
 PUB_KEY_PREFIX_LEN = 6
 PUB_KEY_SIZE = 32  # full key, used only off-wire for contact lookup
 
@@ -186,6 +188,16 @@ class Response:
                 raise EnvelopeError(
                     "first chunk (chunk_number=0) requires uncompressed_size "
                     "and total_chunks"
+                )
+            # Check if chunking are within the hard limits of the payload
+            if self.total_chunks > MAX_TOTAL_CHUNKS:
+                raise EnvelopeError(
+                    f"total_chunks {self.total_chunks} exceeds {MAX_TOTAL_CHUNKS}"
+                )
+            if self.uncompressed_size > MAX_UNCOMPRESSED_SIZE:
+                raise EnvelopeError(
+                    f"uncompressed_size {self.uncompressed_size} exceeds "
+                    f"{MAX_UNCOMPRESSED_SIZE}"
                 )
 
         fixed = _RESP_FIXED.pack(
