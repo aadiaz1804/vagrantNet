@@ -11,8 +11,7 @@ import zlib
 from dataclasses import dataclass
 
 from meshcore import EventType, MeshCore
-
-from ..common import chunking, compress, transport
+from ..common import chunking, compress, discovery, transport
 from ..common.envelope import (
     EnvelopeError,
     Request,
@@ -111,6 +110,8 @@ class VagrantNetClient:
         self.mc = mc
         self.dial = dial
         self._pending: dict[int, _PendingFetch] = {}
+        self._contacts: dict[str, dict] = {}
+        self.on_servers_changed = None
         self._link_down = asyncio.Event()
         self._supervisor: asyncio.Task | None = None
         self._subscribe()
@@ -118,6 +119,33 @@ class VagrantNetClient:
     def _subscribe(self) -> None:
         self.mc.subscribe(EventType.RAW_DATA, self._on_raw_data)
         self.mc.subscribe(EventType.DISCONNECTED, self._on_disconnected)
+        # Keep listening the way meshcore-cli does
+        self.mc.subscribe(EventType.ADVERTISEMENT, self._on_advert)
+        self.mc.subscribe(EventType.NEW_CONTACT, self._on_advert)
+
+    async def _on_advert(self, event) -> None:
+        payload = event.payload or {}
+        if not isinstance(payload, dict):
+            return
+        # ADVERTISEMENT gets the advert and pkey
+        key = payload.get("public_key") or payload.get("adv_key")
+        if not key:
+            return
+        record = dict(self._contacts.get(key) or {})
+        record.update(payload)
+        record["public_key"] = key
+        record.setdefault("type", payload.get("adv_type", 0))
+        record.setdefault("out_path_len", -1)  # an advert carries no path
+        was_server = discovery.is_marked((self._contacts.get(key) or {}).get("adv_name"))
+        self._contacts[key] = record
+        if discovery.is_marked(record.get("adv_name")) and not was_server:
+            logger.info("heard a new vagrantNet server: %r", record.get("adv_name"))
+            if self.on_servers_changed:
+                self.on_servers_changed(self.known_servers())
+
+    def known_servers(self) -> list:
+        # vNet seen devices
+        return discovery.servers(list(self._contacts.values()))
 
     @classmethod
     async def connect_serial(
@@ -252,6 +280,15 @@ class VagrantNetClient:
             bytes.fromhex(contact.get("out_path") or ""),
             max(int(contact.get("out_path_len", 0)), 0),
         )
+
+    async def discover(self, timeout: float = discovery.SCAN_TIMEOUT_SECONDS):
+        # Find vagrantNet servers the radio has already heard advertise.
+        contacts = await discovery.scan(self.mc, timeout=timeout)
+        for c in contacts:
+            key = c.get("public_key")
+            if key:
+                self._contacts[key] = {**(self._contacts.get(key) or {}), **c}
+        return self.known_servers(), discovery.census(list(self._contacts.values()))
 
     def _own_pubkey_prefix(self) -> bytes:
         pk_hex = self.mc.self_info.get("public_key")

@@ -17,6 +17,12 @@ class ConnectionConfig:
 @dataclass
 class DaemonConfig:
     node_name: str = "vagrantNet Node"
+    # Stamp discovery.MARKER onto the radio's advertised name so clients can discover it.
+    # On by default, but can be disabled to run a private node that serves anyone who
+    # already knows its public key 
+    advertise_as_server: bool = True
+    # How often to re-flood the advert so clients can find it.
+    advert_interval_hours: float = 6.0
     pages_dir: Path = Path("~/vn/pages").expanduser()
     downloads_dir: Path = Path("~/vn/content").expanduser()
     connection: ConnectionConfig = field(default_factory=ConnectionConfig)
@@ -33,6 +39,8 @@ class DaemonConfig:
         conn_raw = raw.get("connection", {})
         return DaemonConfig(
             node_name=raw.get("node_name", "vagrantNet Node"),
+            advertise_as_server=bool(raw.get("advertise_as_server", True)),
+            advert_interval_hours=float(raw.get("advert_interval_hours", 6.0)),
             pages_dir=Path(raw.get("pages_dir", "~/vn/pages")).expanduser(),
             downloads_dir=Path(
                 raw.get("downloads_dir", "~/vn/content")

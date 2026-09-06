@@ -28,7 +28,7 @@ from prompt_toolkit.mouse_events import MouseEventType
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
-
+from ..common import discovery
 from ..common.envelope import Subcommand
 from ..common.page import LINK_RE, Link, extract_links, render_ansi
 from .client import VagrantNetClient, VagrantNetError
@@ -47,6 +47,7 @@ server rm <name>                          forget a saved server
 open <server> [path]                      fetch and render a page (default: index.vn)
 go <n>                                    follow link <n> from the current page
 back                                      return to the previous page
+discover                                  list nearby vagrantNet servers (no LoRa)
 ls [server]                               list a server's pages (default: current server)
 get <path>                                download a file from the current server
 fav add <label>                           save the current page as a favorite
@@ -58,13 +59,7 @@ quit / exit                               leave
 """
 
 class Shell:
-    """Session model: connection, navigation, favourites.
-
-    Everything it wants to say goes through `emit`, and a fetched page goes
-    through `show_page`, so the same proven logic drives either the plain REPL
-    or the full-screen UI. Defaults print, which is what the REPL wants.
-    """
-
+    # Session model: connection, navigation, favourites.
     def __init__(self, emit=None, show_page=None) -> None:
         self.emit = emit or print
         self.show_page = show_page or self._print_page
@@ -74,6 +69,8 @@ class Shell:
         self.current_path: str | None = None
         self.current_links: list[Link] = []
         self.nav_stack: list[tuple[str, str]] = []
+        self.found: list[discovery.Found] = []
+        self.census: dict[str, int] = {}
 
     # ---------------- connection -----------------------------------------
     async def connect(self, target: str, pin: str | None = None) -> None:
@@ -131,6 +128,31 @@ class Shell:
         self.current_path = path
         self.current_links = extract_links(text)
         self.show_page(server, path, text, self.current_links)
+
+    async def discover(self, announce: bool = True) -> None:
+        # List vagrantNet servers the radio has already heard.
+        client = self._require_client()
+        if client is None:
+            return
+        if announce:
+            self.emit("scanning the radio's contact table (no traffic sent)...")
+        # Refresh the list live when a server we had not heard of advertises.
+        def _live(servers):
+            self.found = servers
+            self.emit(f"heard a new vagrantNet server ({len(servers)} known)")
+        client.on_servers_changed = _live
+        self.found, self.census = await client.discover()
+        seen = ", ".join(f"{n} {k}s" for k, n in sorted(self.census.items()))
+        self.emit(f"heard {sum(self.census.values())} nodes ({seen})")
+        if not self.found:
+            self.emit("no vagrantNet servers advertising yet -- a server has to "
+                      "set advertise_as_server for it to be findable")
+            return
+        self.emit(f"{len(self.found)} vagrantNet server(s):")
+        for i, f in enumerate(self.found, start=1):
+            where = f"{f.hops} hop(s)" if f.reachable else "no path yet"
+            self.emit(f"  [{i}] {f.name}  ({f.kind}, {where})  {f.pubkey[:12]}...")
+        self.emit("use: server add <name> <pubkey>   then: open <name>")
 
     def _print_page(self, server, path, text, links) -> None:
         print(render_ansi(text))
@@ -285,6 +307,8 @@ class Shell:
                 await self.go(int(args[0]))
         elif cmd == "back":
             await self.back()
+        elif cmd == "discover":
+            await self.discover()
         elif cmd == "ls":
             await self.list_pages(args[0] if args else None)
         elif cmd == "get":
@@ -319,6 +343,7 @@ def _completer() -> NestedCompleter:
             "open": None,
             "go": None,
             "back": None,
+            "discover": None,
             "ls": None,
             "get": None,
             "fav": {"add": None, "ls": None, "rm": None},
@@ -392,8 +417,8 @@ SPLASH_COMMANDS = [
     ("open <server>",          "fetch and render index.vn"),
     ("ls [server]",            "list public server files"),
     ("server add <name> <pk>", "save a server by name"),
-    # TODO: Add server discovery command? Or will it be done server side [WIP]
     ("connect <port|addr>",    "attach to a radio"),
+    ("discover",               "find servers already heard (free)"),
 ]
 
 KEYS_HELP = [
@@ -494,6 +519,15 @@ class VagrantNetUI:
                  ("class:splash.key", f"{cmd:<28}", h),
                  ("class:splash.text", what, h)])
         row([])
+        if self.shell.found:
+            row([("class:splash.dim", "        nearby servers", h)])
+            for i, f in enumerate(self.shell.found[:6], start=1):
+                where = f"{f.hops} hop" if f.reachable else "no path"
+                row([("class:splash.dim", "          ", h),
+                     ("class:page.linknum", f"{i}. ", h),
+                     ("class:splash.text", f"{f.name:<22}", h),
+                     ("class:splash.dim", f"{f.kind}, {where}", h)])
+            row([])
         servers = list(self.shell.config.servers)
         favs = self.shell.config.favorites
         if servers:
@@ -804,7 +838,12 @@ async def main() -> None:
 
     app = ui.build()
     if ui.shell.config.last_connection_target:
-        ui._spawn(ui.shell.autoconnect_if_known())
+        async def boot():
+            await ui.shell.autoconnect_if_known()
+            if ui.shell.client:
+                # Free, so run it unprompted part of TUI build
+                await ui.shell.discover(announce=False)
+        ui._spawn(boot())
     try:
         await app.run_async()
     finally:

@@ -11,7 +11,7 @@ import zlib
 from pathlib import Path
 
 from meshcore import EventType, MeshCore
-from ..common import chunking, compress, envelope, transport
+from ..common import chunking, compress, discovery, envelope, transport
 from ..common.envelope import Request, Response, StatusCode, Subcommand
 from ..common.safepath import PathTraversalError, resolve_within
 from .config import DaemonConfig
@@ -95,7 +95,25 @@ class VagrantNetDaemon:
         query_result = await self.mc.commands.send_device_query()
         if query_result.type == EventType.ERROR:
             raise RuntimeError(f"device query failed: {query_result.payload}")
+        await self._announce_identity()
         logger.info("daemon connected as %r", self.config.node_name)
+
+    async def _announce_identity(self) -> None:
+        # Put the vagrantNet marker in the node's advertised name.
+        if not self.config.advertise_as_server:
+            return
+        current = (self.mc.self_info or {}).get("name") or ""
+        wanted = discovery.mark(self.config.node_name)
+        if current == wanted:
+            logger.info("advertising as %r already", wanted)
+            return
+        result = await self.mc.commands.set_name(wanted)
+        if result is not None and result.type == EventType.ERROR:
+            logger.warning("could not set advertised name: %s", result.payload)
+            return
+        logger.info("now advertising as %r (was %r)", wanted, current)
+        # Flood this one after identity change
+        await self.mc.commands.send_advert(flood=True)
 
     async def _on_disconnected(self, event) -> None:
         payload = event.payload or {}
@@ -110,6 +128,21 @@ class VagrantNetDaemon:
             self._link_down.set()
         else:
             logger.info("link lost, auto-reconnect in progress: %s", payload)
+
+    async def _advert_loop(self) -> None:
+        # Re-flood the advert occasionally so the server stays findable.
+        if not self.config.advertise_as_server or self.config.advert_interval_hours <= 0:
+            return
+        period = self.config.advert_interval_hours * 3600
+        while True:
+            await asyncio.sleep(period)
+            if self.mc is None:
+                return
+            try:
+                await self.mc.commands.send_advert(flood=True)
+                logger.info("re-advertised (every %.1fh)", self.config.advert_interval_hours)
+            except Exception as exc:
+                logger.warning("periodic advert failed: %s", exc)
 
     async def _heartbeat_loop(self) -> None:
         # Active probe device link rather than only reacting to it.
@@ -162,8 +195,9 @@ class VagrantNetDaemon:
             stop_task = asyncio.ensure_future(stop.wait())
             link_down_task = asyncio.ensure_future(self._link_down.wait())
             heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
+            advert_task = asyncio.ensure_future(self._advert_loop())
             _, pending = await asyncio.wait(
-                [stop_task, link_down_task, heartbeat_task],
+                [stop_task, link_down_task, heartbeat_task, advert_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in pending:

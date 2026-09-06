@@ -3,11 +3,15 @@
   "pages_dir": "~/vn/pages",
   "downloads_dir": "~/vn/content",
   "connection": {
-    "kind": "serial", 
+    "kind": "serial",
     "target": "/dev/ttyUSB0",
     "baudrate": 115200
   },
   "max_in_flight_transfers_per_client": 2,
   "max_in_flight_transfers_total": 8,
-  "content_token_ttl_seconds": 300
+  "content_token_ttl_seconds": 300,
+  "advertise_as_server": true,
+  "_advertise_as_server": "true (default): append '[vNet]' to this node's MeshCore name so clients discover. Set false to run a private node only people with the pKey can find it.",
+  "advert_interval_hours": 6.0,
+  "_advert_interval_hours": "How often to re-flood this node's advert, set to 0 to never re-flood"
 }
