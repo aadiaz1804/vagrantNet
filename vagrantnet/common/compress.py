@@ -1,31 +1,43 @@
-"""zstd wrapper for page/file payloads. Falls back to no dictionary until one is trained."""
-
+"""zstd compression for page and file payloads.
+   Known limitations: 
+       1. The dictionary is built from English-language pages ONLY
+       2. Pages with non-standard formatting or file transfers may not compress well
+       3. As the dictionary is needed on server/client its not possible to change without access to both devices or transmitting it
+"""
+# TODO: Add support for dict missmatch/negotiation, and custom dictionaries for file transfers/non-english language.
 from __future__ import annotations
-from pathlib import Path
+import functools
+import logging
+import pathlib
 
 import zstandard as zstd
 
-DEFAULT_LEVEL = 19  # max non-"ultra" level; pages are tiny, compress once, ratio > speed
+logger = logging.getLogger("vagrantnet.compress")
+DEFAULT_LEVEL = 19  # pages are tiny and compressed once; ratio over speed
+DICT_PATH = pathlib.Path(__file__).with_name("vn_dict.bin")
 
-def _load_dict(dict_path: Path | None) -> zstd.ZstdCompressionDict | None:
-    if dict_path is None or not dict_path.exists():
+@functools.lru_cache(maxsize=1)
+def dictionary() -> zstd.ZstdCompressionDict | None:
+    """The built-in page dictionary, or None if it is missing.
+
+    Missing is survivable -- a broken install still talks to peers that have
+    no dictionary either -- so warn rather than refusing to start.
+    """
+    try:
+        return zstd.ZstdCompressionDict(DICT_PATH.read_bytes())
+    except OSError as exc:
+        logger.warning("no page dictionary at %s (%s); compressing without one",
+                       DICT_PATH, exc)
         return None
-    return zstd.ZstdCompressionDict(dict_path.read_bytes())
 
-def compress(data: bytes, dict_path: Path | None = None, level: int = DEFAULT_LEVEL) -> bytes:
-    zdict = _load_dict(dict_path)
-    cctx = zstd.ZstdCompressor(level=level, dict_data=zdict) if zdict else zstd.ZstdCompressor(level=level)
+def compress(data: bytes, level: int = DEFAULT_LEVEL) -> bytes:
+    zdict = dictionary()
+    cctx = (zstd.ZstdCompressor(level=level, dict_data=zdict) if zdict
+            else zstd.ZstdCompressor(level=level))
     return cctx.compress(data)
 
-def decompress(data: bytes, dict_path: Path | None = None) -> bytes:
-    zdict = _load_dict(dict_path)
-    dctx = zstd.ZstdDecompressor(dict_data=zdict) if zdict else zstd.ZstdDecompressor()
+def decompress(data: bytes) -> bytes:
+    zdict = dictionary()
+    dctx = (zstd.ZstdDecompressor(dict_data=zdict) if zdict
+            else zstd.ZstdDecompressor())
     return dctx.decompress(data)
-
-def train_dictionary(sample_paths: list[Path], out_path: Path, dict_size: int = 4096) -> None:
-    """One-off: train a dictionary from a subset of .vn pages."""
-    samples = [p.read_bytes() for p in sample_paths if p.stat().st_size > 0]
-    if len(samples) < 5:
-        raise ValueError("need at least ~5 sample pages to train a useful dictionary")
-    zdict = zstd.train_dictionary(dict_size, samples)
-    out_path.write_bytes(zdict.as_bytes())

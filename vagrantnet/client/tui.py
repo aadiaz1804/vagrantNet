@@ -82,9 +82,12 @@ class Shell:
         self.emit(f"connecting ({kind}) to {target}...")
         try:
             self.client = (
-                await VagrantNetClient.connect_ble(target, pin=pin, quiet=True)
+                await VagrantNetClient.connect_ble(
+                    target, pin=pin, quiet=True,
+                    flood_advert=self.config.flood_advert)
                 if kind == "ble"
-                else await VagrantNetClient.connect_serial(target, quiet=True)
+                else await VagrantNetClient.connect_serial(
+                    target, quiet=True, flood_advert=self.config.flood_advert)
             )
         except VagrantNetError as e:
             self.emit(f"connect failed: {e}")

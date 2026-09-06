@@ -1,0 +1,48 @@
+# vagrantNet daemon systemd unit example
+#
+#   sudo cp vagrantnet/server/vagrantnet.service /etc/systemd/system/
+#   sudo systemctl edit vagrantnet          # set User/WorkingDirectory below
+#   sudo systemctl enable --now vagrantnet
+#
+# The daemon handles SIGTERM properly -- it stops within milliseconds even
+# mid-backoff, and drops DTR/RTS on the way out so the radio is left usable.
+# That matters: a daemon killed with SIGKILL leaves DTR asserted and the
+# firmware then ignores the next connect.
+
+[Unit]
+Description=vagrantNet daemon (serves pages over MeshCore LoRa)
+Documentation=https://github.com/aadiaz1804/vagrantNet
+After=network.target
+# Wait for the radio's USB serial adapter if one is present.
+Wants=dev-serial-by\x2did.device
+# Don't let a boot-time flapping radio spin forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=vagrantnet
+Group=dialout
+WorkingDirectory=/opt/vagrantnet
+ExecStart=/opt/vagrantnet/.venv/bin/python -u -m vagrantnet.server.server /opt/vagrantnet/config.json
+
+# In case of crash/unexpected exit
+Restart=always
+RestartSec=10
+
+# It only needs its own directory, the serial port, and the network.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/vagrantnet
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vagrantnet
+
+[Install]
+WantedBy=multi-user.target

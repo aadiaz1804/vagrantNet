@@ -1,4 +1,4 @@
-"""vagrantNet daemon: serves pages and files over MeshCore's raw-data transport."""
+"""vagrantNet server: serves pages and files over MeshCore's raw-data transport."""
 
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ from meshcore import EventType, MeshCore
 from ..common import chunking, compress, discovery, envelope, transport
 from ..common.envelope import Request, Response, StatusCode, Subcommand
 from ..common.safepath import PathTraversalError, resolve_within
-from .config import DaemonConfig
+from .config import ServerConfig
 from .store import NoTokenAvailable, Transfer, TransferStore
 
-logger = logging.getLogger("vagrantnet.daemon")
+logger = logging.getLogger("vagrantnet.server")
 
 LOG_FORMAT = "%(asctime)s.%(msecs)03d %(name)s %(levelname)s %(message)s"
 LOG_DATEFMT = "%H:%M:%S"
@@ -25,11 +25,12 @@ LOG_DATEFMT = "%H:%M:%S"
 CONNECT_MAX_ATTEMPTS = 4
 CONNECT_RETRY_DELAY_SECONDS = 3.0
 CONNECT_BACKOFF_MAX_SECONDS = 60.0
+CONTACT_REFRESH_SECONDS = 900.0  # rebuild the routing table every 15 min
 HEARTBEAT_INTERVAL_SECONDS = 60.0
 HEARTBEAT_TIMEOUT_SECONDS = 15.0
 
-class VagrantNetDaemon:
-    def __init__(self, config: DaemonConfig):
+class VagrantNetServer:
+    def __init__(self, config: ServerConfig):
         self.config = config
         self.mc: MeshCore | None = None
         config.pages_dir.mkdir(parents=True, exist_ok=True)
@@ -41,12 +42,21 @@ class VagrantNetDaemon:
             max_per_client=config.max_in_flight_transfers_per_client,
         )
         self._link_down = asyncio.Event()
+        # pubkey hex -> contact record
+        self._contacts: dict[str, dict] = {}
 
     # ---------------- Hosting lifecycle -----------------------------------------
     async def connect(self) -> None:
         conn = self.config.connection
         if conn.kind not in ("serial", "tcp", "ble"):
             raise ValueError(f"unknown connection kind: {conn.kind!r}")
+        if conn.kind == "serial" and conn.target.strip().lower() in ("", "auto"):
+            found = await transport.autodetect_serial(conn.baudrate)
+            if found is None:
+                raise RuntimeError(
+                    "connection.target is 'auto' but no MeshCore radio answered "
+                )
+            conn.target = found
         # Retry loop for the initial connect (radio busy/not powered up yet).
         last_error: Exception | None = None
         for attempt in range(1, CONNECT_MAX_ATTEMPTS + 1):
@@ -91,12 +101,14 @@ class VagrantNetDaemon:
         self._link_down = asyncio.Event()
         self.mc.subscribe(EventType.RAW_DATA, self._on_raw_data)
         self.mc.subscribe(EventType.DISCONNECTED, self._on_disconnected)
+        self.mc.subscribe(EventType.ADVERTISEMENT, self._on_contact)
+        self.mc.subscribe(EventType.NEW_CONTACT, self._on_contact)
 
         query_result = await self.mc.commands.send_device_query()
         if query_result.type == EventType.ERROR:
             raise RuntimeError(f"device query failed: {query_result.payload}")
         await self._announce_identity()
-        logger.info("daemon connected as %r", self.config.node_name)
+        logger.info("server connected as %r", self.config.node_name)
 
     async def _announce_identity(self) -> None:
         # Put the vagrantNet marker in the node's advertised name.
@@ -128,6 +140,49 @@ class VagrantNetDaemon:
             self._link_down.set()
         else:
             logger.info("link lost, auto-reconnect in progress: %s", payload)
+
+    async def _on_contact(self, event) -> None:
+        payload = event.payload or {}
+        if not isinstance(payload, dict):
+            return
+        key = payload.get("public_key") or payload.get("adv_key")
+        if not key:
+            return
+        record = dict(self._contacts.get(key) or {})
+        record.update(payload)
+        record["public_key"] = key
+        self._contacts[key] = record
+
+    async def _contact_refresh_loop(self) -> None:
+        # Learn return paths so replies can travel more than one hop.
+        while True:
+            try:
+                for contact in await discovery.scan(self.mc):
+                    key = contact.get("public_key")
+                    if key:
+                        self._contacts[key] = {
+                            **(self._contacts.get(key) or {}), **contact}
+                routable = sum(1 for c in self._contacts.values()
+                               if int(c.get("out_path_len", -1)) > 0)
+                logger.info("routing table: %d contacts, %d with a multi-hop path",
+                            len(self._contacts), routable)
+            except Exception as exc:
+                logger.warning("contact refresh failed: %s", exc)
+            await asyncio.sleep(CONTACT_REFRESH_SECONDS)
+
+    def _reply_path(self, prefix: bytes) -> bytes:
+        # Route back to the client that sent this request.
+        want = prefix.hex().lower()
+        for key, contact in self._contacts.items():
+            if not key.lower().startswith(want):
+                continue
+            hops = int(contact.get("out_path_len", -1))
+            path = contact.get("out_path") or ""
+            if hops > 0 and path:
+                logger.debug("replying to %s via %d hop(s)", want, hops)
+                return bytes.fromhex(path)
+            return b""  # known, and a direct neighbour
+        return b""  # never heard of them; direct is the best guess
 
     async def _advert_loop(self) -> None:
         # Re-flood the advert occasionally so the server stays findable.
@@ -172,7 +227,7 @@ class VagrantNetDaemon:
         loop = asyncio.get_running_loop()
         stop = asyncio.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
-            # Ensure that when daemon is killed, DTR/RTS is dropped and cleaned
+            # Ensure that when server is killed, DTR/RTS is dropped and cleaned
             loop.add_signal_handler(sig, stop.set)
 
         backoff = CONNECT_RETRY_DELAY_SECONDS
@@ -196,8 +251,10 @@ class VagrantNetDaemon:
             link_down_task = asyncio.ensure_future(self._link_down.wait())
             heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
             advert_task = asyncio.ensure_future(self._advert_loop())
+            contacts_task = asyncio.ensure_future(self._contact_refresh_loop())
             _, pending = await asyncio.wait(
-                [stop_task, link_down_task, heartbeat_task, advert_task],
+                [stop_task, link_down_task, heartbeat_task, advert_task,
+                 contacts_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in pending:
@@ -243,12 +300,16 @@ class VagrantNetDaemon:
             await self._reply_error(req, status)
             return
 
-        compressed = compress.compress(uncompressed)
-        # only worth using the compressed form if it's actually smaller
-        use_compressed = len(compressed) < len(uncompressed) and req.prefer_compressed
+        # What costs time on this link in chunks (messages)
+        raw_chunks = chunking.split(uncompressed)
+        use_compressed = False
+        chunks = raw_chunks
+        if req.prefer_compressed:
+            compressed = compress.compress(uncompressed)
+            comp_chunks = chunking.split(compressed)
+            if len(comp_chunks) < len(raw_chunks):
+                use_compressed, chunks = True, comp_chunks
         payload = compressed if use_compressed else uncompressed
-
-        chunks = chunking.split(payload)
         if (
             len(chunks) > envelope.MAX_TOTAL_CHUNKS
             or len(uncompressed) > envelope.MAX_UNCOMPRESSED_SIZE
@@ -413,7 +474,8 @@ class VagrantNetDaemon:
             len(payload),
         )
         started = time.monotonic()
-        send_result = await self.mc.commands.send_raw_data(payload)
+        send_result = await self.mc.commands.send_raw_data(
+            payload, path=self._reply_path(req.client_pubkey_prefix))
         elapsed = time.monotonic() - started
         if send_result.type == EventType.ERROR:
             logger.warning(
@@ -440,12 +502,12 @@ async def _main(config_path: str) -> None:
         datefmt=LOG_DATEFMT,
         force=True,
     )
-    config = DaemonConfig.load(Path(config_path))
-    daemon = VagrantNetDaemon(config)
-    await daemon.run_forever()
+    config = ServerConfig.load(Path(config_path))
+    server = VagrantNetServer(config)
+    await server.run_forever()
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("usage: python -m vagrantnet.daemon.server /path/to/config.json")
+        print("usage: python -m vagrantnet.server.server /path/to/config.json")
         sys.exit(1)
     asyncio.run(_main(sys.argv[1]))

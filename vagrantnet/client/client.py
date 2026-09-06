@@ -1,4 +1,4 @@
-"""vagrantNet client: fetches pages/files/listings from a daemon over MeshCore."""
+"""vagrantNet client: fetches pages/files/listings from a server over MeshCore."""
 
 from __future__ import annotations
 
@@ -76,6 +76,7 @@ class _Dial:
     baudrate: int = 115200
     pin: str | None = None
     quiet: bool = False  # suppress the meshcore library's INFO chatter
+    flood_advert: bool = False
 
 async def _dial(d: _Dial) -> MeshCore:
     async def _try(attempt: int) -> MeshCore:
@@ -149,24 +150,26 @@ class VagrantNetClient:
 
     @classmethod
     async def connect_serial(
-        cls, port: str, baudrate: int = 115200, *, quiet: bool = False
+        cls, port: str, baudrate: int = 115200, *, quiet: bool = False, flood_advert: bool = False
     ) -> "VagrantNetClient":
-        dial = _Dial("serial", port, baudrate=baudrate, quiet=quiet)
+        dial = _Dial("serial", port, baudrate=baudrate, quiet=quiet,
+                     flood_advert=flood_advert)
         return await cls._ready(await _dial(dial), dial)
 
     @classmethod
     async def connect_ble(
-        cls, address: str, pin: str | None = None, *, quiet: bool = False
+        cls, address: str, pin: str | None = None, *, quiet: bool = False, flood_advert: bool = False
     ) -> "VagrantNetClient":
-        dial = _Dial("ble", address, pin=pin, quiet=quiet)
+        dial = _Dial("ble", address, pin=pin, quiet=quiet,
+                     flood_advert=flood_advert)
         return await cls._ready(await _dial(dial), dial)
 
     @classmethod
     async def _ready(cls, mc: MeshCore, dial: _Dial | None = None) -> "VagrantNetClient":
         # No bulk contacts sync for speed, after radio is ready we only ask for the one contact we need for the server's pk.
         await mc.commands.send_device_query()
-        # Do a quick advert without flood to get near repeaters
-        await mc.commands.send_advert(flood=False)
+        # Announce ourselves so servers can route replies back.
+        await mc.commands.send_advert(flood=dial.flood_advert if dial else False)
         client = cls(mc, dial)
         if dial is not None:
             client._supervisor = asyncio.ensure_future(client._supervise())

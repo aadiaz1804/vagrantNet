@@ -8,3 +8,5 @@ config*.json
 !config.example.json
 des
 *egg-info*
+build/
+dist/

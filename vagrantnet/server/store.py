@@ -59,7 +59,7 @@ class TransferStore:
 
         in_flight = sum(1 for t in self._by_token.values() if t.completed_at is None)
         if in_flight >= self.max_total:
-            raise NoTokenAvailable("daemon at max_total in-flight transfers")
+            raise NoTokenAvailable("server at max_total in-flight transfers")
         if self._count_for_client(client_pubkey_prefix) >= self.max_per_client:
             raise NoTokenAvailable("client at max_per_client in-flight transfers")
 

@@ -1,7 +1,6 @@
 """Finding vagrantNet servers minimizing mesh traffic
     1  companion / chat node      2  repeater      3  room server
 A fourth value for "vagrantNet server" is the right long-term answer
-`adv_type` is decided by which firmware is flashed. 
 For now vNet server is a "companion node" that advertises as [vNet]
 """
 
@@ -18,7 +17,6 @@ logger = logging.getLogger("vagrantnet.discovery")
 
 # v1 Name marker for vagrantNet servers, in 32-byte advert name field.
 MARKER = "[vNet]"
-
 ADV_TYPE_CHAT = 1
 ADV_TYPE_REPEATER = 2
 ADV_TYPE_ROOM = 3
@@ -58,8 +56,7 @@ class Found:
 
     @property
     def reachable(self) -> bool:
-        """A flood-only contact has no path to send a request along, and the
-        daemon replies zero-hop, so anything past one hop can't answer yet."""
+        # Check if reachable
         return self.hops >= 0
 
 async def scan(mc, timeout: float = SCAN_TIMEOUT_SECONDS) -> list[dict]:

@@ -1,4 +1,4 @@
-""" MeshCore connect helpers, shared daemon/client.
+""" MeshCore connect helpers, shared server/client.
 1. Hardware autoreconnect
    - serial: this radio's companion session won't complete CMD_APP_START
      unless DTR/RTS is pulsed after the first connect, since a totally fresh session doesn't need it.
@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import serial
-from meshcore import MeshCore
+from meshcore import EventType, MeshCore
 from meshcore.ble_cx import BLEConnection
 from meshcore.serial_cx import SerialConnection
 
@@ -65,16 +65,7 @@ async def _bluez_force_disconnect(address: str) -> None:
         bus.disconnect()
 
 async def _bluez_known_device(address: str):
-    """Return a bleak BLEDevice for an already-bonded address, or None.
-
-    BlueZ only announces a device through InterfacesAdded when it first
-    discovers it. A bonded radio is already in BlueZ's object tree, so it is
-    never re-announced -- and bleak's address-string lookup sits waiting for
-    that event until it times out with BleakDeviceNotFoundError, even while
-    the radio is advertising happily. Handing bleak the existing object
-    instead skips discovery altogether (observed 2026-09-06: 30s timeout and
-    four failed attempts by address, 1.2s by path).
-    """
+    # Return a bleak BLEDevice for an already-bonded address, or None.
     try:
         from bleak.backends.device import BLEDevice
         from dbus_fast import BusType
@@ -108,7 +99,6 @@ async def _bluez_known_device(address: str):
 
 class _ResilientSerialConnection(SerialConnection):
     # SerialConnection that pulses DTR/RTS before every connect after the first
-
     def __init__(self, *args, pulse_before_first_connect: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self._connected_once = pulse_before_first_connect
@@ -122,7 +112,7 @@ class _ResilientSerialConnection(SerialConnection):
         return result
 
 class _ResilientBLEConnection(BLEConnection):
-    #BLEConnection that clears a stale BlueZ link on its first connect not on retry.
+    # BLEConnection that clears a stale BlueZ link on its first connect not on retry.
     def __init__(self, *args, force_disconnect_before_first_connect: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
         self._pending_force_disconnect = force_disconnect_before_first_connect
@@ -135,6 +125,50 @@ class _ResilientBLEConnection(BLEConnection):
             # BLEConnection.connect() uses `device` verbatim when set
             self.device = await _bluez_known_device(self.address)
         return await super().connect()
+
+# USB-serial bridges example list for easy auto discovery 
+_KNOWN_BRIDGES = {
+    (0x10C4, 0xEA60),  # CP210x: Heltec, LilyGO
+    (0x1A86, 0x7523),  # WCH CH340
+    (0x1A86, 0x55D4),  # WCH CH9102
+    (0x239A, None),    # Adafruit USB CDC
+    (0x303A, None),    # Espressif native USB
+}
+
+def candidate_serial_ports() -> list[str]:
+    # Serial ports that might have a radio on them
+    from serial.tools import list_ports
+
+    def rank(port) -> tuple:
+        known = (port.vid, port.pid) in _KNOWN_BRIDGES or (port.vid, None) in _KNOWN_BRIDGES
+        return (0 if known else 1, port.device)
+
+    # USB only. A PC advertises ~32 legacy /dev/ttyS* ports
+    usb = [p for p in list_ports.comports() if p.vid is not None]
+    return [p.device for p in sorted(usb, key=rank)]
+
+async def autodetect_serial(baudrate: int = 115200) -> str | None:
+    # Work out which port the radio is on by asking each one.
+    for port in candidate_serial_ports():
+        logger.info("probing %s for a MeshCore radio", port)
+        try:
+            mc = await connect_serial(port, baudrate, auto_reconnect=False, quiet=True)
+        except Exception as exc:
+            logger.debug("%s did not answer: %s", port, exc)
+            continue
+        if mc is None:
+            continue
+        try:
+            result = await mc.commands.send_device_query()
+            if result is not None and result.type != EventType.ERROR:
+                logger.info("found a MeshCore radio on %s", port)
+                return port
+        except Exception as exc:
+            logger.debug("%s answered but not as MeshCore: %s", port, exc)
+        finally:
+            await _close_quietly(mc)
+    logger.warning("no MeshCore radio found on any serial port")
+    return None
 
 async def _close_quietly(mc: MeshCore) -> None:
     # Failed connect/cleanup 
@@ -173,7 +207,6 @@ async def connect_serial(
         await _close_quietly(mc)
         return None
     return mc
-
 
 async def connect_ble(
     address: str,

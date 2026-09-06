@@ -1,4 +1,4 @@
-"""Daemon configuration, loaded from a JSON files from config.json."""
+"""Server configuration, loaded from a JSON files from config.json."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ class ConnectionConfig:
     baudrate: int = 115200  # serial only ignored on BLE and TCP
 
 @dataclass
-class DaemonConfig:
+class ServerConfig:
     node_name: str = "vagrantNet Node"
     # Stamp discovery.MARKER onto the radio's advertised name so clients can discover it.
     # On by default, but can be disabled to run a private node that serves anyone who
@@ -34,10 +34,10 @@ class DaemonConfig:
     content_token_linger_seconds: int = 60 # How long a finished transfer stays fetchable
 
     @staticmethod
-    def load(path: Path) -> "DaemonConfig":
+    def load(path: Path) -> "ServerConfig":
         raw = json.loads(path.read_text())
         conn_raw = raw.get("connection", {})
-        return DaemonConfig(
+        return ServerConfig(
             node_name=raw.get("node_name", "vagrantNet Node"),
             advertise_as_server=bool(raw.get("advertise_as_server", True)),
             advert_interval_hours=float(raw.get("advert_interval_hours", 6.0)),

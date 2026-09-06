@@ -9,3 +9,15 @@ dependencies = [
     "pyserial>=3.5",
     "prompt_toolkit>=3.0",
 ]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["vagrantnet*"]
+
+[tool.setuptools.package-data]
+# The page dictionary must ship with the package -- both ends need the same
+# one, and without it compression silently falls back to no dictionary.
+"vagrantnet.common" = ["vn_dict.bin"]

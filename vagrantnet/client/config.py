@@ -1,4 +1,4 @@
-"""Client-side persisted state: known servers, favorites, last connection. Separate from daemon/config.py's DaemonConfig """
+"""Client-side persisted state: known servers, favorites, last connection. Separate from daemon/config.py's ServerConfig """
 
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ class ClientConfig:
     last_connection_pin: str | None = None
     servers: dict[str, str] = field(default_factory=dict)  # name -> pubkey hex
     favorites: list[Favorite] = field(default_factory=list)
+    # Flood our advert on connect. Needed to reach servers more than one hop away
+    flood_advert: bool = False
 
     @staticmethod
     def load(path: Path = DEFAULT_CONFIG_PATH) -> "ClientConfig":
@@ -40,6 +42,7 @@ class ClientConfig:
                 Favorite(server=f["server"], path=f["path"], label=f["label"])
                 for f in raw.get("favorites", [])
             ],
+            flood_advert=bool(raw.get("flood_advert", False)),
         )
 
     def save(self) -> None:
@@ -51,6 +54,7 @@ class ClientConfig:
                 "pin": self.last_connection_pin,
             },
             "servers": self.servers,
+            "flood_advert": self.flood_advert,
             "favorites": [
                 {"server": f.server, "path": f.path, "label": f.label}
                 for f in self.favorites
