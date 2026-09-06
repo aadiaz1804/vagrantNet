@@ -25,10 +25,7 @@ from ..common.page import render_ansi
 logger = logging.getLogger("vagrantnet.client")
 
 CHUNK_TIMEOUT_SECONDS = 15.0
-# Total time willing to keep retrying one chunk before surfacing an error --
-# TCP-like: link drops and lost packets are invisible retries up to this
-# point, not a fixed attempt count, since real LoRa loss rates don't fit a
-# "3 tries and give up" model (see NOTES.md, ~1/3 arrival rate observed).
+# Total time willing to keep retrying one chunk before surfacing an error
 CHUNK_RETRY_DEADLINE_SECONDS = 90.0
 CHUNK_RETRY_JITTER_SECONDS = (0.5, 2.0)
 CONNECT_MAX_ATTEMPTS = 4
@@ -42,15 +39,11 @@ class VagrantNetError(RuntimeError):
     pass
 
 async def _retry(coro_fn, *, attempts: int, delay: float, what: str):
-    """Bounded retry for a first connect attempt -- there's no live session
-    to fall back on yet, so unlike CHUNK_RETRY_DEADLINE_SECONDS this has to
-    give up eventually rather than retry indefinitely. Once connected,
-    `transport.connect_serial`/`connect_ble`'s auto_reconnect takes over for
-    any drop that happens afterwards."""
+    # Retry for a first connect attempt
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            return await coro_fn()
+            return await coro_fn(attempt)
         except (ConnectionError, OSError) as exc:
             last_error = exc
             logger.warning("%s attempt %d/%d failed: %s", what, attempt, attempts, exc)
@@ -74,8 +67,10 @@ class VagrantNetClient:
     # TODO: Support having vagrantNetClient and MeshCore cli/clients at the same time
     # (Maybe a middleware layer to avoid the /dev/ttyUSBX interface being locked by MeshCore CLI or vagrantNetClient)
     async def connect_serial(cls, port: str, baudrate: int = 115200) -> "VagrantNetClient":
-        async def _try() -> MeshCore:
-            mc = await transport.connect_serial(port, baudrate)
+        async def _try(attempt: int) -> MeshCore:
+            mc = await transport.connect_serial(
+                port, baudrate, pulse_before_first_connect=attempt > 1
+            )
             if mc is None:
                 raise ConnectionError(f"could not connect to MeshCore device at {port}")
             return mc
@@ -90,8 +85,10 @@ class VagrantNetClient:
 
     @classmethod
     async def connect_ble(cls, address: str, pin: str | None = None) -> "VagrantNetClient":
-        async def _try() -> MeshCore:
-            mc = await transport.connect_ble(address, pin=pin)
+        async def _try(attempt: int) -> MeshCore:
+            mc = await transport.connect_ble(
+                address, pin=pin, force_disconnect_before_first_connect=attempt == 1
+            )
             if mc is None:
                 raise ConnectionError(f"could not connect to MeshCore device at {address}")
             return mc
@@ -300,6 +297,10 @@ async def _main(argv: list[str]) -> None:
     }.get(cmd_str)
     if subcommand is None:
         print(f"unknown command: {cmd_str}")
+        sys.exit(1)
+    if subcommand != Subcommand.LIST_PAGES and not path:
+        # Catch path error
+        print(f"{cmd_str} requires a path")
         sys.exit(1)
 
     client = (

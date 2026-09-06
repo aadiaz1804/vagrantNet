@@ -80,11 +80,31 @@ class _ResilientSerialConnection(SerialConnection):
         return result
 
 class _ResilientBLEConnection(BLEConnection):
-    # BLEConnection that clears any stale BlueZ link before every connect
+    """BLEConnection that clears a stale BlueZ link on its first connect
+    only, not on every retry.
+
+    Calling _bluez_force_disconnect unconditionally on every attempt means
+    every outer retry *and* every future auto_reconnect cycle issues a
+    D-Bus disconnect RPC against the adapter -- across a real retry
+    sequence that's dozens of disconnect calls against a device we've
+    never actually connected to yet, the exact "keep touching the
+    hardware" pattern that destabilizes BLE on this machine (observed
+    2026-09-06: a 20-attempt retry loop with this unconditional call never
+    connected once). The stale-link case this exists for is a leftover
+    session from *before this process started* -- checking for it once,
+    on the first attempt, covers that; repeating the check on every retry
+    within the same run doesn't, since nothing new can connect to the
+    device between our own attempts.
+    """
+
+    def __init__(self, *args, force_disconnect_before_first_connect: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pending_force_disconnect = force_disconnect_before_first_connect
 
     async def connect(self):
-        if self.address:
+        if self._pending_force_disconnect and self.address:
             await _bluez_force_disconnect(self.address)
+        self._pending_force_disconnect = False
         return await super().connect()
 
 async def connect_serial(
@@ -118,10 +138,13 @@ async def connect_ble(
     *,
     auto_reconnect: bool = True,
     max_reconnect_attempts: int = DEFAULT_MAX_RECONNECT_ATTEMPTS,
-) -> MeshCore | None:
-    """Mirrors MeshCore.create_ble(), but with the hygiene-wrapped
-    connection and auto_reconnect wired in from the start."""
-    connection = _ResilientBLEConnection(address=address, pin=pin)
+    force_disconnect_before_first_connect: bool = True,) -> MeshCore | None:
+    #Mirrors MeshCore.create_ble(), but with autoconnect
+    connection = _ResilientBLEConnection(
+        address=address,
+        pin=pin,
+        force_disconnect_before_first_connect=force_disconnect_before_first_connect,
+    )
     mc = MeshCore(
         connection,
         auto_reconnect=auto_reconnect,

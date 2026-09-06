@@ -20,11 +20,15 @@ logger = logging.getLogger("vagrantnet.daemon")
 
 CONNECT_MAX_ATTEMPTS = 4
 CONNECT_RETRY_DELAY_SECONDS = 3.0
+HEARTBEAT_INTERVAL_SECONDS = 60.0
+HEARTBEAT_TIMEOUT_SECONDS = 15.0
 
 class VagrantNetDaemon:
     def __init__(self, config: DaemonConfig):
         self.config = config
         self.mc: MeshCore | None = None
+        config.pages_dir.mkdir(parents=True, exist_ok=True)
+        config.downloads_dir.mkdir(parents=True, exist_ok=True)
         self.store = TransferStore(
             ttl_seconds=config.content_token_ttl_seconds,
             max_total=config.max_in_flight_transfers_total,
@@ -52,7 +56,10 @@ class VagrantNetDaemon:
                     host, port_str = conn.target.split(":")
                     self.mc = await MeshCore.create_tcp(host, int(port_str))
                 elif conn.kind == "ble":
-                    self.mc = await transport.connect_ble(conn.target)
+                    self.mc = await transport.connect_ble(
+                        conn.target,
+                        force_disconnect_before_first_connect=attempt == 1,
+                    )
                 else:
                     raise ValueError(f"unknown connection kind: {conn.kind!r}")
                 if self.mc is not None:
@@ -75,9 +82,8 @@ class VagrantNetDaemon:
         if self.mc is None:
             raise RuntimeError(
                 f"failed to connect to MeshCore device ({conn.kind}:{conn.target}) "
-                f"after {CONNECT_MAX_ATTEMPTS} attempts -- device not responding, "
-                "check it's flashed with companion firmware and the port/address "
-                "is correct"
+                f"after {CONNECT_MAX_ATTEMPTS} attempts... did not answer, "
+                "check it's flashed with companion firmware and the port/address is correct"
             )
         self._link_down = asyncio.Event()
         self.mc.subscribe(EventType.RAW_DATA, self._on_raw_data)
@@ -102,6 +108,24 @@ class VagrantNetDaemon:
         else:
             logger.info("link lost, auto-reconnect in progress: %s", payload)
 
+    async def _heartbeat_loop(self) -> None:
+        # Active probe device link rather than only reacting to it.
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            if self.mc is None:
+                return
+            try:
+                result = await asyncio.wait_for(
+                    self.mc.commands.send_device_query(),
+                    timeout=HEARTBEAT_TIMEOUT_SECONDS,
+                )
+                if result is None or result.type == EventType.ERROR:
+                    raise ConnectionError(f"heartbeat query failed: {result}")
+            except Exception as exc:
+                logger.error("heartbeat failed, treating link as down: %s", exc)
+                self._link_down.set()
+                return
+
     async def disconnect(self) -> None:
         if self.mc is not None:
             await self.mc.disconnect()
@@ -118,14 +142,16 @@ class VagrantNetDaemon:
             await self.connect()
             stop_task = asyncio.ensure_future(stop.wait())
             link_down_task = asyncio.ensure_future(self._link_down.wait())
+            heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
             _, pending = await asyncio.wait(
-                [stop_task, link_down_task], return_when=asyncio.FIRST_COMPLETED
+                [stop_task, link_down_task, heartbeat_task],
+                return_when=asyncio.FIRST_COMPLETED,
             )
             for task in pending:
                 task.cancel()
             if stop.is_set():
                 break
-            # auto_reconnect gave up, no transport path
+            # auto_reconnect gave up, or the heartbeat caught a silent
             await self.disconnect()
 
         logger.info("shutting down")
