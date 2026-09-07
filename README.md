@@ -102,7 +102,11 @@ cp config.example.json config.json   # remember to update the config
 python -m vagrantnet.server.server config.json
 ```
 
-Drop `.vn` files in `pages_dir` and they are served.
+Drop `.vn` files in `pages_dir` and they are served. Drop anything else in
+`downloads_dir` and it shows up in the `[Files|files]` listing every page can
+link to. Keep separate as `.vn` files in `downloads_dir` gets
+listed but a client will try to fetch it as a page and get NOT_FOUND, since
+paths ending in `.vn` are resolved against `pages_dir`.
 
 `"target": "auto"` makes the server find its own radio by asking each USB
 serial port which one answers the companion protocol. It picks the first port that answers, you can also give an explicit path if you have two radios on one host and the path does not change.
@@ -144,10 +148,15 @@ rebuilds its routing table every 15 minutes.
   !allow <key>   restrict this page to the listed pkeys (whitelisting)
   anything else  plain paragraph text
 
-Malformed lines render as plain text.
+Malformed lines (including a typo'd `!directive`) render as plain text.
 
 `!c` colours a *block*, not a span. Done for bandwidth
-`!allow` never reaches the radio, done server-side
+`!allow` is processed server-side. It's matched against
+the 6-byte pubkey prefix a request carries on the wire.
+
+A link whose path doesn't end in `.vn` is a file clients fetch it
+with GET_FILE and save it instead of rendering it. `[Files|files]` is always
+available and lists whatever is in `downloads_dir`.
 ```
 
 Check what a page will actually cost before publishing it:
@@ -183,7 +192,8 @@ more than one hop away may well be discoverable but not yet fetchable.
 
 **Roadmap:** This was built for internal adoption but if there is interest a Wiki will be in progress with future work like a vNet enabled phone/desktop app could be added in the future, also further testing on real mesh users on other hardware and submitting vNet as a non-dev protocol to MeshCore. 
 
-*Note: There is no encryption or authentication above what MeshCore itself provides.*
+*Note: There is no authentication above what MeshCore itself provides.
+`!allow` on a page is a 6-byte pubkey-prefix match against the request and it keeps a page off `ls`*
 
 ## Contact
 If you'd like to help or contribute, feel free to log a bug report, fork the project or push an MR on the protocol and I will try to address it. If you'd like to reach out to me directly for any inquiries (for now) the only contact is over aadiaz1804@proton.me

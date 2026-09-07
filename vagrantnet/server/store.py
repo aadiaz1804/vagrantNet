@@ -15,6 +15,7 @@ class Transfer:
     uncompressed_size: int
     compressed: bool
     checksum: int | None
+    dict_id: int = 0
     created_at: float = field(default_factory=time.monotonic)
     completed_at: float | None = None  # set once the final chunk has been sent
 

@@ -9,10 +9,13 @@
   !allow <key>   restrict this page to the listed pkeys (whitelisting)
   anything else  plain paragraph text
 
-Malformed lines render as plain text.
+Malformed lines (including an unknown `!directive`) render as plain text.
 
 `!c` colours a *block*, not a span. Done for bandwidth
-`!allow` never reaches the radio, done server-side
+`!allow` Matched against a 6-byte pubkey prefix
+
+A link whose path does not end in `.vn` (and is not the special `files` listing
+path) names a plain file clients can fetch it with GET_FILE and save.
 """
 
 from __future__ import annotations
@@ -25,10 +28,21 @@ COLOURS = ("dim", "red", "green", "yellow", "blue", "magenta", "cyan", "white")
 DEFAULT_COLOUR = ""
 
 SERVER_DIRECTIVES = ("allow",)
+FILES_LISTING_PATH = "files"  # server-generated listing of downloads_dir
+
 _ANSI_RESET = "\x1b[0m"
 _ANSI_BOLD = "\x1b[1m"
 _ANSI_UNDERLINE = "\x1b[4m"
 _ANSI_DIM = "\x1b[2m"
+_ANSI_COLOUR = {
+    "red": "\x1b[31m", "green": "\x1b[32m", "yellow": "\x1b[33m",
+    "blue": "\x1b[34m", "magenta": "\x1b[35m", "cyan": "\x1b[36m",
+    "white": "\x1b[37m", "dim": _ANSI_DIM,
+}
+
+def is_page_path(path: str) -> bool:
+    p = (path or "").strip("/")
+    return p in ("", FILES_LISTING_PATH) or p.endswith(".vn")
 
 @dataclass
 class Link:
@@ -75,12 +89,14 @@ def parse(vn_text: str) -> list[Line]:
             parts = stripped[1:].split()
             name = parts[0] if parts else ""
             if name in SERVER_DIRECTIVES:
-                continue  # server-only
+                continue  # stripped server-side already; drop if it slipped through
             if name == "c":
                 arg = parts[1].lower() if len(parts) > 1 else ""
                 colour = arg if arg in COLOURS else DEFAULT_COLOUR
                 continue
-            continue  # unknown directive, continues
+            # unknown directive, add as text
+            lines.append(Line("text", raw, colour=colour))
+            continue
 
         match = LINK_RE.match(stripped)
         if match:
@@ -101,7 +117,7 @@ def parse(vn_text: str) -> list[Line]:
     return lines
 
 def extract_links(vn_text: str) -> list[Link]:
-    """Pull out every [Label|path] link, in document order."""
+    # Pull out every [Label|path] link, in document order.
     links: list[Link] = []
     for line in vn_text.splitlines():
         m = LINK_RE.match(line.strip())
@@ -111,28 +127,26 @@ def extract_links(vn_text: str) -> list[Link]:
 
 def render_ansi(vn_text: str) -> str:
     out_lines: list[str] = []
-    for raw_line in vn_text.splitlines():
-        line = raw_line.rstrip("\n")
-        stripped = line.strip()
-
-        link_match = LINK_RE.match(stripped)
-        if link_match:
+    for line in parse(vn_text):
+        colour = _ANSI_COLOUR.get(line.colour, "")
+        if line.kind == "link":
+            marker = "" if is_page_path(line.link.path) else "↓ "  # download
             out_lines.append(
-                f"  {_ANSI_UNDERLINE}{link_match.group('label')}"
-                f"{_ANSI_RESET} {_ANSI_DIM}[{link_match.group('path')}]{_ANSI_RESET}"
+                f"  {colour}{_ANSI_UNDERLINE}{marker}{line.link.label}"
+                f"{_ANSI_RESET} {_ANSI_DIM}[{line.link.path}]{_ANSI_RESET}"
             )
-        elif stripped.startswith("### "):
-            out_lines.append(f"{_ANSI_BOLD}{stripped[4:]}{_ANSI_RESET}")
-        elif stripped.startswith("## "):
-            out_lines.append(f"\n{_ANSI_BOLD}{stripped[3:].upper()}{_ANSI_RESET}")
-        elif stripped.startswith("# "):
-            out_lines.append(f"\n{_ANSI_BOLD}=== {stripped[2:].upper()} ==={_ANSI_RESET}\n")
-        elif stripped.startswith("> "):
-            out_lines.append(f"  {_ANSI_DIM}| {stripped[2:]}{_ANSI_RESET}")
-        elif stripped == "---":
-            out_lines.append(_ANSI_DIM + ("-" * 40) + _ANSI_RESET)
+        elif line.kind == "h3":
+            out_lines.append(f"{colour}{_ANSI_BOLD}{line.text}{_ANSI_RESET}")
+        elif line.kind == "h2":
+            out_lines.append(f"\n{colour}{_ANSI_BOLD}{line.text.upper()}{_ANSI_RESET}")
+        elif line.kind == "h1":
+            out_lines.append(f"\n{colour}{_ANSI_BOLD}=== {line.text.upper()} ==={_ANSI_RESET}\n")
+        elif line.kind == "quote":
+            out_lines.append(f"  {colour or _ANSI_DIM}| {line.text}{_ANSI_RESET}")
+        elif line.kind == "rule":
+            out_lines.append((colour or _ANSI_DIM) + ("-" * 40) + _ANSI_RESET)
         else:
-            out_lines.append(line)
+            out_lines.append(f"{colour}{line.text}{_ANSI_RESET}" if colour else line.text)
     return "\n".join(out_lines)
 
 
@@ -142,15 +156,18 @@ def wire_cost(vn_text: str) -> tuple[int, int, bool]:
 
     raw = vn_text.encode("utf-8")
     raw_chunks = chunking.split(raw)
-    packed = compress.compress(raw)
+    packed, _ = compress.compress(raw)
     packed_chunks = chunking.split(packed)
     if len(packed_chunks) < len(raw_chunks):
         return len(packed), len(packed_chunks), True
     return len(raw), len(raw_chunks), False
 
-def validate(vn_text: str, max_bytes: int = 10_240) -> list[str]:
-    # Non-fatal lint
+def validate(
+    vn_text: str, max_bytes: int = 2_048, max_airtime_seconds: float = 5.0
+) -> list[str]:
+    # Non-fatal lint. Against 2kb/5s airtime convention
     from .envelope import MAX_TOTAL_CHUNKS, MAX_UNCOMPRESSED_SIZE
+    from . import airtime
 
     warnings: list[str] = []
     size = len(vn_text.encode("utf-8"))
@@ -171,6 +188,16 @@ def validate(vn_text: str, max_bytes: int = 10_240) -> list[str]:
             f"page is {size} bytes uncompressed, over the recommended "
             f"{max_bytes}-byte guideline"
         )
+
+    # What it actually costs the mesh.
+    seconds = airtime.fetch_cost(chunks)
+    if seconds > max_airtime_seconds:
+        warnings.append(
+            f"page costs {seconds:.1f}s of shared airtime per fetch at zero "
+            f"hop ({airtime.share_of_mesh_day(seconds):.2f}% of the mesh's "
+            f"day), over the {max_airtime_seconds:.0f}s guideline"
+            "split file and link it instead of transmitting everything is possible"
+        )
     for i, line in enumerate(vn_text.splitlines(), start=1):
         stripped = line.strip()
         if stripped.startswith("[") and not LINK_RE.match(stripped):
@@ -180,6 +207,7 @@ def validate(vn_text: str, max_bytes: int = 10_240) -> list[str]:
 if __name__ == "__main__":
     # Lint a .vn page before publishing it
     import sys
+    from . import airtime
 
     if len(sys.argv) < 2:
         print("usage: python -m vagrantnet.common.page <page.vn> [...]")
@@ -190,8 +218,11 @@ if __name__ == "__main__":
             text = handle.read()
         wire, chunks, packed = wire_cost(text)
         how = "compressed" if packed else "raw"
+        seconds = airtime.fetch_cost(chunks)
         print(f"{path}: {wire} bytes on the wire ({how}), {chunks} chunk(s), "
-              f"~{chunks * 0.6:.1f}s to fetch, {len(extract_links(text))} link(s)")
+              f"{seconds:.1f}s airtime "
+              f"({airtime.share_of_mesh_day(seconds):.2f}% of the mesh's day), "
+              f"{len(extract_links(text))} link(s)")
         for warning in validate(text):
             bad += 1
             print(f"  ! {warning}")

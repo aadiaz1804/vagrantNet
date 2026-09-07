@@ -11,7 +11,7 @@ import zlib
 from pathlib import Path
 
 from meshcore import EventType, MeshCore
-from ..common import chunking, compress, discovery, envelope, transport
+from ..common import chunking, compress, discovery, envelope, page, transport
 from ..common.envelope import Request, Response, StatusCode, Subcommand
 from ..common.safepath import PathTraversalError, resolve_within
 from .config import ServerConfig
@@ -276,6 +276,16 @@ class VagrantNetServer:
         try:
             data = bytes.fromhex(raw_hex)
             req = Request.decode(data)
+        except envelope.UnsupportedVersionError as exc:
+            # A real peer on a different build. 
+            logger.warning(
+                "request from %s speaks protocol v%d, we speak %s -- refusing",
+                exc.client_pubkey_prefix.hex() if exc.client_pubkey_prefix else "?",
+                exc.version,
+                sorted(envelope.SUPPORTED_VERSIONS),
+            )
+            await self._reply_unsupported_version(exc)
+            return
         except (envelope.EnvelopeError, ValueError):
             return  # not a recognized frame
 
@@ -300,15 +310,18 @@ class VagrantNetServer:
             await self._reply_error(req, status)
             return
 
-        # What costs time on this link in chunks (messages)
+        # What costs time on this link in chunks.
         raw_chunks = chunking.split(uncompressed)
         use_compressed = False
+        dict_used = envelope.DICT_NONE
         chunks = raw_chunks
         if req.prefer_compressed:
-            compressed = compress.compress(uncompressed)
+            compressed, dict_id = compress.compress(
+                uncompressed, peer_dict_id=req.dict_id
+            )
             comp_chunks = chunking.split(compressed)
             if len(comp_chunks) < len(raw_chunks):
-                use_compressed, chunks = True, comp_chunks
+                use_compressed, chunks, dict_used = True, comp_chunks, dict_id
         payload = compressed if use_compressed else uncompressed
         if (
             len(chunks) > envelope.MAX_TOTAL_CHUNKS
@@ -339,6 +352,7 @@ class VagrantNetServer:
                 compressed=use_compressed,
                 is_final=True,
                 checksum=checksum,
+                dict_id=dict_used,
             )
             return
 
@@ -354,6 +368,7 @@ class VagrantNetServer:
                 uncompressed_size=len(uncompressed),
                 compressed=use_compressed,
                 checksum=checksum,
+                dict_id=dict_used,
             )
             try:
                 token = self.store.start(req.client_pubkey_prefix, transfer)
@@ -371,6 +386,7 @@ class VagrantNetServer:
             compressed=transfer.compressed,
             is_final=False,
             checksum=None,
+            dict_id=transfer.dict_id,
         )
 
     async def _handle_continue(self, req: Request) -> None:
@@ -395,6 +411,7 @@ class VagrantNetServer:
             compressed=transfer.compressed,
             is_final=is_final,
             checksum=transfer.checksum if is_final else None,
+            dict_id=transfer.dict_id,
         )
         if is_final:
             self.store.finish(req.content_token)
@@ -404,9 +421,19 @@ class VagrantNetServer:
         if req.subcommand == Subcommand.LIST_PAGES:
             listing = "# Available Pages\n\n"
             for page_file in sorted(self.config.pages_dir.glob("**/*.vn")):
+                try:
+                    text = page_file.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    logger.warning("skipping %s in listing: %s", page_file, exc)
+                    continue
+                if not self._allowed(text, req.client_pubkey_prefix):
+                    continue  # an !allow'd page doesn't announce itself either
                 rel = page_file.relative_to(self.config.pages_dir)
                 listing += f"[{page_file.stem}|{rel}]\n"
             return listing.encode("utf-8"), StatusCode.OK
+
+        if req.subcommand == Subcommand.GET_PAGE and (req.path or "").strip("/") == page.FILES_LISTING_PATH:
+            return self._list_downloads(), StatusCode.OK
 
         root = (
             self.config.pages_dir
@@ -421,9 +448,70 @@ class VagrantNetServer:
         if not file_path.exists() or not file_path.is_file():
             return b"", StatusCode.NOT_FOUND
 
-        return file_path.read_bytes(), StatusCode.OK
+        if req.subcommand != Subcommand.GET_PAGE:
+            return file_path.read_bytes(), StatusCode.OK
+
+        try:
+            text = file_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("failed to read page %s: %s", file_path, exc)
+            return b"", StatusCode.ERROR
+        if not self._allowed(text, req.client_pubkey_prefix):
+            return b"", StatusCode.ACCESS_DENIED
+        return page.strip_server_directives(text).encode("utf-8"), StatusCode.OK
+
+    def _list_downloads(self) -> bytes:
+        listing = "# Files\n\n"
+        for f in sorted(self.config.downloads_dir.glob("**/*")):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(self.config.downloads_dir)
+            listing += f"[{rel}|{rel}]\n"
+        return listing.encode("utf-8")
+
+    def _allowed(self, page_text: str, client_prefix: bytes) -> bool:
+        # Process !allow directive, if it exists
+        allowed_keys: list[str] = []
+        for name, args in page.directives(page_text):
+            if name == "allow":
+                allowed_keys.extend(args)
+        if not allowed_keys:
+            return True
+        client_hex = client_prefix.hex()
+        for key in allowed_keys:
+            key_hex = key.lower().replace(":", "")
+            n = min(len(key_hex), len(client_hex))
+            if n and key_hex[:n] == client_hex[:n]:
+                return True
+        return False
 
     # ----------------- outbound ------------------------------------------
+    async def _reply_unsupported_version(
+        self, exc: envelope.UnsupportedVersionError
+    ) -> None:
+        # Answer a frame we could only partly parse.
+        if exc.request_id is None or self.mc is None:
+            return
+        resp = Response(
+            request_id=exc.request_id,
+            status=StatusCode.UNSUPPORTED_VERSION,
+            chunk_number=0,
+            content_token=0,
+            payload=b"",
+            is_final=True,
+            uncompressed_size=0,
+            total_chunks=1,
+        )
+        path = (
+            self._reply_path(exc.client_pubkey_prefix)
+            if exc.client_pubkey_prefix
+            else b""
+        )
+        try:
+            await self.mc.commands.send_raw_data(resp.encode(), path=path)
+        except Exception as send_exc:
+            logger.warning("could not answer version mismatch: %s", send_exc)
+
     async def _reply_error(self, req: Request, status: StatusCode) -> None:
         await self._send_chunk(
             req,
@@ -451,6 +539,7 @@ class VagrantNetServer:
         is_final: bool,
         checksum: int | None,
         status: StatusCode = StatusCode.OK,
+        dict_id: int = envelope.DICT_NONE,
     ) -> None:
         assert self.mc is not None
         resp = Response(
@@ -464,6 +553,7 @@ class VagrantNetServer:
             checksum=checksum,
             uncompressed_size=uncompressed_size if chunk_number == 0 else None,
             total_chunks=total_chunks if chunk_number == 0 else None,
+            dict_id=dict_id,
         )
 
         payload = resp.encode()

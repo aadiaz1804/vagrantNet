@@ -8,6 +8,10 @@ from enum import IntEnum
 
 PROTO_MARKER = 0b01  # top 2 bits of ctrl byte; soft sanity check, not crypto
 VERSION = 1
+SUPPORTED_VERSIONS = frozenset({VERSION})
+
+# The version field is two bits, so it can only ever say 0-3 
+VERSION_EXTENDED = 0b11
 
 MAX_SAFE_PAYLOAD = 160 # Max verified payload size for a single CMD_SEND_RAW_DATA
 MAX_TOTAL_CHUNKS = 0xFF        # total_chunks is one byte
@@ -32,28 +36,68 @@ class StatusCode(IntEnum):
     ERROR = 3
     INVALID_REQUEST = 4
     UNKNOWN_TOKEN = 5  # CONTINUE referenced an expired/unknown token. Retry GET_PAGE/GET_FILE
+    UNSUPPORTED_VERSION = 6  # peer speaks a protocol version we don't
+    # 7 is the last value the 3-bit status field can carry.
 
 REQ_FLAG_PREFER_COMPRESSED = 0b0001
 
-# status_flags packs StatusCode (bits 0-2) and these flags into one byte --
+# status_flags packs StatusCode (bits 0-2) and these flags into one byte 
 # flags start at bit 3 to stay clear of it.
 RESP_FLAG_COMPRESSED = 0b00001000  # bit 3
 RESP_FLAG_FINAL_CHUNK = 0b00010000  # bit 4
 RESP_FLAG_HAS_CHECKSUM = 0b00100000  # bit 5
-RESP_FLAG_IS_FIRST = 0b01000000  # bit 6 -- header carries size + total_chunks
+RESP_FLAG_IS_FIRST = 0b01000000  # bit 6 size + total_chunks
 # bit 7 reserved
 
-def _pack_ctrl(msg_type: MsgType) -> int:
-    return (PROTO_MARKER << 6) | ((VERSION & 0b11) << 4) | ((int(msg_type) & 0b1) << 3)
+# ctrl byte:  MM VV T DDD
+#   MM  bits 6-7  protocol marker
+#   VV  bits 4-5  version
+#   T   bit 3     message type
+#   DDD bits 0-2  compression dictionary id (0 = none)
+DICT_ID_MASK = 0b111
+DICT_NONE = 0
 
-def _unpack_ctrl(ctrl: int) -> tuple[int, int, MsgType]:
+def _pack_ctrl(msg_type: MsgType, dict_id: int = DICT_NONE) -> int:
+    return (
+        (PROTO_MARKER << 6)
+        | ((VERSION & 0b11) << 4)
+        | ((int(msg_type) & 0b1) << 3)
+        | (dict_id & DICT_ID_MASK)
+    )
+
+def _unpack_ctrl(ctrl: int) -> tuple[int, int, MsgType, int]:
     marker = (ctrl >> 6) & 0b11
     version = (ctrl >> 4) & 0b11
     msg_type = MsgType((ctrl >> 3) & 0b1)
-    return marker, version, msg_type
+    dict_id = ctrl & DICT_ID_MASK
+    return marker, version, msg_type, dict_id
 
 class EnvelopeError(ValueError):
     pass
+
+# Header: ctrl(1) request_id(2) client_pubkey_prefix(6).
+FROZEN_HEADER_LEN = 9
+
+class UnsupportedVersionError(EnvelopeError):
+    # Peer speaks a version we don't. Carry answer.
+    def __init__(self, version: int, request_id: int | None = None,
+                 client_pubkey_prefix: bytes | None = None):
+        self.version = version
+        self.request_id = request_id
+        self.client_pubkey_prefix = client_pubkey_prefix
+        super().__init__(
+            f"peer speaks protocol version {version}, this build speaks "
+            f"{sorted(SUPPORTED_VERSIONS)}"
+        )
+
+def _check_version(version: int, data: bytes) -> None:
+    if version in SUPPORTED_VERSIONS:
+        return
+    request_id = prefix = None
+    if len(data) >= FROZEN_HEADER_LEN:
+        request_id = int.from_bytes(data[1:3], "little")
+        prefix = data[3:FROZEN_HEADER_LEN]
+    raise UnsupportedVersionError(version, request_id, prefix)
 
 def _check_size(out: bytes, what: str) -> bytes:
     if len(out) > MAX_SAFE_PAYLOAD:
@@ -79,6 +123,8 @@ class Request:
     path: str | None = None          # required unless subcommand == CONTINUE
     content_token: int | None = None  # required if subcommand == CONTINUE
     prefer_compressed: bool = True
+    # Which compression dictionary this client has.
+    dict_id: int = DICT_NONE
 
     def encode(self) -> bytes:
         if len(self.client_pubkey_prefix) != PUB_KEY_PREFIX_LEN:
@@ -89,7 +135,7 @@ class Request:
         subcmd_flags = (int(self.subcommand) & 0b111) | ((flags & 0b1) << 3)
 
         fixed = _REQ_FIXED.pack(
-            _pack_ctrl(MsgType.REQUEST),
+            _pack_ctrl(MsgType.REQUEST, self.dict_id),
             self.request_id & 0xFFFF,
             self.client_pubkey_prefix,
             subcmd_flags,
@@ -114,9 +160,11 @@ class Request:
         ctrl, request_id, pubkey_prefix, subcmd_flags, chunk_number = (
             _REQ_FIXED.unpack(data[:REQ_FIXED_LEN])
         )
-        marker, version, msg_type = _unpack_ctrl(ctrl)
+        marker, version, msg_type, dict_id = _unpack_ctrl(ctrl)
         if marker != PROTO_MARKER or msg_type != MsgType.REQUEST:
             raise EnvelopeError("not a valid request frame")
+        # Marker first, version second
+        _check_version(version, data)
 
         subcommand = Subcommand(subcmd_flags & 0b111)
         prefer_compressed = bool((subcmd_flags >> 3) & 0b1)
@@ -132,6 +180,7 @@ class Request:
                 chunk_number=chunk_number,
                 content_token=tail[0],
                 prefer_compressed=prefer_compressed,
+                dict_id=dict_id,
             )
 
         return Request(
@@ -141,6 +190,7 @@ class Request:
             chunk_number=chunk_number,
             path=tail.decode("utf-8", errors="strict"),
             prefer_compressed=prefer_compressed,
+            dict_id=dict_id,
         )
 
 # ------------ RESPONSE FORMAT ------------------------------------------------
@@ -167,6 +217,8 @@ class Response:
     # only meaningful / transmitted when chunk_number == 0:
     uncompressed_size: int | None = None
     total_chunks: int | None = None
+    # Which dictionary the payload was actually compressed with
+    dict_id: int = DICT_NONE
 
     @property
     def is_first(self) -> bool:
@@ -199,7 +251,7 @@ class Response:
                 )
 
         fixed = _RESP_FIXED.pack(
-            _pack_ctrl(MsgType.RESPONSE),
+            _pack_ctrl(MsgType.RESPONSE, self.dict_id),
             self.request_id & 0xFFFF,
             status_flags,
             self.chunk_number & 0xFF,
@@ -225,9 +277,10 @@ class Response:
         ctrl, request_id, status_flags, chunk_number, content_token = (
             _RESP_FIXED.unpack(data[:RESP_FIXED_LEN])
         )
-        marker, version, msg_type = _unpack_ctrl(ctrl)
+        marker, version, msg_type, dict_id = _unpack_ctrl(ctrl)
         if marker != PROTO_MARKER or msg_type != MsgType.RESPONSE:
             raise EnvelopeError("not a valid response frame")
+        _check_version(version, data)
 
         status = StatusCode(status_flags & 0b111)
         compressed = bool(status_flags & RESP_FLAG_COMPRESSED)
@@ -263,4 +316,5 @@ class Response:
             checksum=checksum,
             uncompressed_size=uncompressed_size,
             total_chunks=total_chunks,
+            dict_id=dict_id,
         )

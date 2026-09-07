@@ -363,6 +363,7 @@ class VagrantNetClient:
             subcommand=subcommand,
             chunk_number=0,
             path=path,
+            dict_id=compress.active_dict_id(),
         )
         resp = await self._send_and_wait(server_path, req, timeout)
 
@@ -373,6 +374,7 @@ class VagrantNetClient:
         total_chunks = resp.total_chunks or 1
         uncompressed_size = resp.uncompressed_size or 0
         compressed = resp.compressed
+        server_dict_id = resp.dict_id
         content_token = resp.content_token
         checksum = resp.checksum if resp.is_final else None
 
@@ -385,6 +387,7 @@ class VagrantNetClient:
                 subcommand=Subcommand.CONTINUE,
                 chunk_number=chunk_n,
                 content_token=content_token,
+                dict_id=compress.active_dict_id(),
             )
             cont_resp = await self._send_and_wait(server_path, cont_req, timeout)
             if cont_resp.status == StatusCode.UNKNOWN_TOKEN:
@@ -401,7 +404,10 @@ class VagrantNetClient:
 
         body = chunking.reassemble(chunks, total_chunks)
         if compressed:
-            body = compress.decompress(body)
+            try:
+                body = compress.decompress(body, dict_id=server_dict_id)
+            except compress.DictionaryMismatch as exc:
+                raise VagrantNetError(str(exc)) from exc
 
         if checksum is not None and zlib.crc32(body) != checksum:
             raise VagrantNetError("Checksum mismatch (corrupted/invalid transfer)")

@@ -9,6 +9,7 @@ import re
 import shlex
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
@@ -30,7 +31,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 from ..common import discovery
 from ..common.envelope import Subcommand
-from ..common.page import LINK_RE, Link, extract_links, render_ansi
+from ..common.page import Link, extract_links, is_page_path, parse as parse_page, render_ansi
 from .client import VagrantNetClient, VagrantNetError
 from .config import ClientConfig, DEFAULT_CONFIG_PATH
 
@@ -38,6 +39,21 @@ logger = logging.getLogger("vagrantnet.tui")
 
 HISTORY_PATH = DEFAULT_CONFIG_PATH.parent / "shell_history"
 _BLE_ADDRESS_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+
+DOWNLOAD_DIR = Path("downloads")  # relative
+
+def _safe_download_path(server_path: str) -> Path | None:
+    # Link is server-supplied confined to DOWNLOAD_DIR and refuse escapes
+    parts = [p for p in PurePosixPath(server_path.replace("\\", "/")).parts
+             if p not in ("", ".")]
+    if not parts or any(p == ".." or p.startswith(".") for p in parts):
+        return None
+    target = DOWNLOAD_DIR.joinpath(*parts).resolve()
+    try:
+        target.relative_to(DOWNLOAD_DIR.resolve())
+    except ValueError:
+        return None
+    return target
 
 HELP_TEXT = """\
 connect <serial-port|ble-address> [pin]   connect to a radio
@@ -117,6 +133,24 @@ class Shell:
         if client is None:
             return
         pubkey = self._resolve_server(server)
+
+        if not is_page_path(path):
+            # not a .vn page, possible file
+            out_path = _safe_download_path(path)
+            if out_path is None:
+                self.emit(f"refusing to save unsafe path: {path!r}")
+                return
+            try:
+                body = await client.fetch(pubkey, Subcommand.GET_FILE, path)
+            except VagrantNetError as e:
+                self.emit(f"download failed: {e}")
+                return
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, "wb") as f:
+                f.write(body)
+            self.emit(f"downloaded {len(body)} bytes to {out_path}")
+            return
+
         try:
             body = await client.fetch(pubkey, Subcommand.GET_PAGE, path)
         except VagrantNetError as e:
@@ -407,6 +441,7 @@ VN_STYLE = Style.from_dict({
     "page.quote":      "#8a8aa0 italic",
     "page.rule":       "#44445a",
     "page.link":       "#c792ea underline",
+    "page.linkfile":   "#86e08a underline",
     "page.linknum":    "#ffcc66 bold",
     "splash.title":    "#82aaff bold",
     "splash.dim":      "#8a8aa0",
@@ -415,6 +450,13 @@ VN_STYLE = Style.from_dict({
     "msg":             "#c3e88d",
     "msg.err":         "#ff8080",
 })
+
+# !c <colour> names -> fg override, appended to a line's class so it composes
+# with whatever heading/quote/link style that line already has.
+PAGE_COLOUR_FG = {
+    "dim": "#8a8aa0", "red": "#ff5f5f", "green": "#86e08a", "yellow": "#ffcc66",
+    "blue": "#82aaff", "magenta": "#c792ea", "cyan": "#66d9ef", "white": "#d0d0e0",
+}
 
 SPLASH_COMMANDS = [
     ("open <server>",          "fetch and render index.vn"),
@@ -554,30 +596,38 @@ class VagrantNetUI:
         by_path = {}
         for i, link in enumerate(t.links):
             by_path.setdefault(link.path, i)
+
+        def styled(base: str, colour: str) -> str:
+            fg = PAGE_COLOUR_FG.get(colour, "")
+            return f"{base} fg:{fg}" if fg else base
+
         lines: list[list] = []
-        for raw in t.text.splitlines():
-            stripped = raw.strip()
-            m = LINK_RE.match(stripped)
-            if m:
-                idx = by_path.get(m.group("path"), None)
+        for pline in parse_page(t.text):
+            if pline.kind == "link":
+                path = pline.link.path
+                idx = by_path.get(path, None)
                 lh = self._handler(idx)
+                is_download = not is_page_path(path)
+                link_class = "page.linkfile" if is_download else "page.link"
+                marker = "↓ " if is_download else ""
                 lines.append([
                     ("class:page.linknum", f"  [{idx + 1 if idx is not None else '?'}] ", lh),
-                    ("class:page.link", m.group("label"), lh),
-                    ("class:splash.dim", f"  ({m.group('path')})", lh),
+                    (f"class:{styled(link_class, pline.colour)}", f"{marker}{pline.link.label}", lh),
+                    ("class:splash.dim", f"  ({path})", lh),
                 ])
-            elif stripped.startswith("### "):
-                lines.append([("class:page.h3", stripped[4:], h)])
-            elif stripped.startswith("## "):
-                lines.append([("class:page.h2", stripped[3:].upper(), h)])
-            elif stripped.startswith("# "):
-                lines.append([("class:page.h1", f"═══ {stripped[2:].upper()} ═══", h)])
-            elif stripped.startswith("> "):
-                lines.append([("class:page.quote", f"  │ {stripped[2:]}", h)])
-            elif stripped == "---":
-                lines.append([("class:page.rule", "-" * 50, h)])
+            elif pline.kind == "h3":
+                lines.append([(f"class:{styled('page.h3', pline.colour)}", pline.text, h)])
+            elif pline.kind == "h2":
+                lines.append([(f"class:{styled('page.h2', pline.colour)}", pline.text.upper(), h)])
+            elif pline.kind == "h1":
+                lines.append([(f"class:{styled('page.h1', pline.colour)}", f"═══ {pline.text.upper()} ═══", h)])
+            elif pline.kind == "quote":
+                lines.append([(f"class:{styled('page.quote', pline.colour)}", f"  │ {pline.text}", h)])
+            elif pline.kind == "rule":
+                lines.append([(f"class:{styled('page.rule', pline.colour)}", "-" * 50, h)])
             else:
-                lines.append([("", raw, h)])
+                fg = PAGE_COLOUR_FG.get(pline.colour, "")
+                lines.append([(f"fg:{fg}" if fg else "", pline.text, h)])
         return lines
 
     def _lines(self) -> list[list]:
