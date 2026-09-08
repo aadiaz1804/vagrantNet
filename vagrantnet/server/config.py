@@ -25,6 +25,10 @@ class ServerConfig:
     advert_interval_hours: float = 6.0
     pages_dir: Path = Path("~/vn/pages").expanduser()
     downloads_dir: Path = Path("~/vn/content").expanduser()
+    boards_dir: Path = Path("~/vn/boards").expanduser()
+    # Off by default. Only enable on PRIVATE MESH
+    enable_file_transfer: bool = False
+    enable_posting: bool = True
     connection: ConnectionConfig = field(default_factory=ConnectionConfig)
 
     # rate limiting config caps guard against ERR_CODE_TABLE_FULL (firmware send-queue exhaustion) if clients overwhelm the LoRa link
@@ -45,6 +49,9 @@ class ServerConfig:
             downloads_dir=Path(
                 raw.get("downloads_dir", "~/vn/content")
             ).expanduser(),
+            boards_dir=Path(raw.get("boards_dir", "~/vn/boards")).expanduser(),
+            enable_file_transfer=bool(raw.get("enable_file_transfer", False)),
+            enable_posting=bool(raw.get("enable_posting", True)),
             connection=ConnectionConfig(
                 kind=conn_raw.get("kind", "serial"),
                 target=conn_raw.get("target", "/dev/ttyUSB0"),

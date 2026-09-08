@@ -1,0 +1,16 @@
+# About
+
+## What this is
+
+A small server on a LoRa mesh. It serves a pages and a message board.
+
+## What is the throughput?
+
+Every fetch spends airtime. A page costs about 1s
+A forum post costs about the same. 
+Keep pages under 2KB and they stay under five seconds TTA.
+
+> Check what a page costs before publishing it:
+> python -m vagrantnet.common.page pages/index.vn
+
+[Back|index.vn]

@@ -29,7 +29,7 @@ from prompt_toolkit.mouse_events import MouseEventType
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
-from ..common import discovery
+from ..common import discovery, page
 from ..common.envelope import Subcommand
 from ..common.page import Link, extract_links, is_page_path, parse as parse_page, render_ansi
 from .client import VagrantNetClient, VagrantNetError
@@ -61,6 +61,12 @@ server add <name> <pubkey-hex>            save a server under a short name
 server ls                                 list saved servers
 server rm <name>                          forget a saved server
 open <server> [path]                      fetch and render a page (default: index.vn)
+boards [server]                           open the board list
+b <name>                                  enter a board (or click it in the sidebar)
+post <text>                               reply in the open thread
+post <subject> | <text>                   start a thread in the open board
+nick <name>                               override the name posts are signed with
+                                          (defaults to your radio's own name)
 go <n>                                    follow link <n> from the current page
 back                                      return to the previous page
 discover                                  list nearby vagrantNet servers (no LoRa)
@@ -87,6 +93,9 @@ class Shell:
         self.nav_stack: list[tuple[str, str]] = []
         self.found: list[discovery.Found] = []
         self.census: dict[str, int] = {}
+        # board name -> (title, last seq on the server), from the index page
+        self.boards: dict[str, tuple[str, int]] = {}
+        self.board_order: list[str] = []
 
     # ---------------- connection -----------------------------------------
     async def connect(self, target: str, pin: str | None = None) -> None:
@@ -109,7 +118,22 @@ class Shell:
             self.emit(f"connect failed: {e}")
             return
         self.config.set_last_connection(kind, target, pin)
+        self._adopt_radio_name()
         self.emit("connected.")
+
+    def _adopt_radio_name(self) -> None:
+        """Post under the name the radio already advertises.
+
+        MeshCore has no separate nickname: set_name() is what goes out in the
+        advert and what everyone else sees you as. Asking for it again would
+        just invite a second, inconsistent identity.
+        """
+        if self.config.nick or self.client is None:
+            return
+        name = discovery.unmark((self.client.mc.self_info or {}).get("name"))
+        if name:
+            self.config.set_nick(name[:24])
+            self.emit(f"posting as {self.config.nick!r} (your radio's name)")
 
     async def autoconnect_if_known(self) -> None:
         if self.config.last_connection_target:
@@ -164,7 +188,89 @@ class Shell:
         self.current_server = server
         self.current_path = path
         self.current_links = extract_links(text)
+        self._remember_boards(text)
+        board = self._board_of(path)
+        if board is not None:
+            high = page.seq(text)
+            if high is not None:
+                self.config.mark_seen(server, board, high)
+                if board in self.boards:
+                    self.boards[board] = (self.boards[board][0], high)
         self.show_page(server, path, text, self.current_links)
+
+    # ---------------- boards ----------------------------------------------
+    def _remember_boards(self, text: str) -> None:
+        seqs = page.board_seqs(text)
+        if not seqs:
+            return
+        titles = {l.path.split("/", 1)[1]: l.label
+                  for l in extract_links(text) if l.path.startswith("b/")}
+        self.boards = {n: (titles.get(n, n), s) for n, s in seqs.items()}
+        self.board_order = [l.path.split("/", 1)[1] for l in extract_links(text)
+                            if l.path.startswith("b/") and l.path.split("/", 1)[1] in seqs]
+
+    def unread(self, board: str) -> int:
+        if self.current_server is None or board not in self.boards:
+            return 0
+        return max(0, self.boards[board][1]
+                   - self.config.last_seen(self.current_server, board))
+
+    async def open_boards(self, server: str | None = None) -> None:
+        target = server or self.current_server
+        if target is None:
+            self.emit("no server, try: open <server>")
+            return
+        await self.open_page(target, page.BOARD_PREFIX)
+
+    async def enter_board(self, board: str, *, unread_only: bool = False) -> None:
+        if self.current_server is None:
+            self.emit("not connected to a server")
+            return
+        path = f"{page.BOARD_PREFIX}/{board}"
+        if unread_only:
+            path += f":{self.config.last_seen(self.current_server, board)}"
+        await self.open_page(self.current_server, path)
+
+    def _board_of(self, path: str | None) -> str | None:
+        p = (path or "").strip("/")
+        if not p.startswith(page.BOARD_PREFIX + "/"):
+            return None
+        head = p[len(page.BOARD_PREFIX) + 1:].partition("/")[0]
+        return head.partition(":")[0].partition("@")[0] or None
+
+    async def post(self, text: str, subject: str = "") -> None:
+        """Post to the open board. Replies if a thread is open, else new thread."""
+        client = self._require_client()
+        if client is None:
+            return
+        if self.current_server is None:
+            self.emit("no server")
+            return
+        board = self._board_of(self.current_path)
+        if board is None:
+            self.emit("not in a board")
+            return
+        if not self.config.nick:
+            self.emit("set a name first:  nick <name>")
+            return
+
+        rest = (self.current_path or "").strip("/")[len(page.BOARD_PREFIX) + 1:]
+        _, _, thread_part = rest.partition("/")
+        thread = thread_part.partition(":")[0]
+        dest = (f"{page.BOARD_PREFIX}/{board}/{thread}" if thread
+                else f"{page.BOARD_PREFIX}/{board}")
+        if not thread and not subject.strip():
+            self.emit("a new thread needs a subject")
+            return
+
+        pubkey = self._resolve_server(self.current_server)
+        try:
+            await client.post(pubkey, dest, self.config.nick, text, subject)
+        except VagrantNetError as e:
+            self.emit(f"post failed: {e}")
+            return
+        self.emit("posted.")
+        await self.open_page(self.current_server, self.current_path, push_history=False)
 
     async def discover(self, announce: bool = True) -> None:
         # List vagrantNet servers the radio has already heard.
@@ -337,6 +443,27 @@ class Shell:
                 self.emit("usage: open <server> [path]")
             else:
                 await self.open_page(args[0], args[1] if len(args) > 1 else "index.vn")
+        elif cmd == "boards":
+            await self.open_boards(args[0] if args else None)
+        elif cmd == "b":
+            if not args:
+                self.emit("usage: b <board>")
+            else:
+                await self.enter_board(args[0])
+        elif cmd == "nick":
+            if not args:
+                self.emit(f"nick is {self.config.nick!r}" if self.config.nick
+                          else "no nick, and the radio has no name, use: nick <name>")
+            else:
+                self.config.set_nick(" ".join(args)[:24])
+                self.emit(f"posting as {self.config.nick!r}")
+        elif cmd == "post":
+            body = " ".join(args)
+            subject, sep, text = body.partition("|")
+            if sep:
+                await self.post(text.strip(), subject.strip())
+            else:
+                await self.post(body.strip())
         elif cmd == "go":
             if not args or not args[0].isdigit():
                 self.emit("usage: go <n>")
@@ -378,6 +505,10 @@ def _completer() -> NestedCompleter:
             "connect": None,
             "server": {"add": None, "ls": None, "rm": None},
             "open": None,
+            "boards": None,
+            "b": None,
+            "nick": None,
+            "post": None,
             "go": None,
             "back": None,
             "discover": None,
@@ -443,6 +574,13 @@ VN_STYLE = Style.from_dict({
     "page.link":       "#c792ea underline",
     "page.linkfile":   "#86e08a underline",
     "page.linknum":    "#ffcc66 bold",
+    "side":            "bg:#16161f",
+    "side.title":      "bg:#16161f #8a8aa0 bold",
+    "side.board":      "bg:#16161f #d0d0e0",
+    "side.active":     "bg:#3b3b58 #ffffff bold",
+    "side.unread":     "bg:#16161f #ffcc66 bold",
+    "side.dim":        "bg:#16161f #55556a",
+    "compose.head":    "bg:#101018 #ffcc66 bold",
     "splash.title":    "#82aaff bold",
     "splash.dim":      "#8a8aa0",
     "splash.key":      "#ffcc66",
@@ -459,6 +597,8 @@ PAGE_COLOUR_FG = {
 }
 
 SPLASH_COMMANDS = [
+    ("boards <server>",        "open the message boards"),
+    ("nick <name>",            "name your posts are signed with"),
     ("open <server>",          "fetch and render index.vn"),
     ("ls [server]",            "list public server files"),
     ("server add <name> <pk>", "save a server by name"),
@@ -469,6 +609,7 @@ SPLASH_COMMANDS = [
 KEYS_HELP = [
     ("ctrl-e", "command"), ("ctrl-g", "help"), ("ctrl-t", "new tab"),
     ("ctrl-w", "close tab"), ("alt-,/.", "prev/next tab"),
+    ("ctrl-b", "boards"), ("ctrl-p", "post"),
     ("ctrl-r", "reload"), ("ctrl-c", "copy page"), ("ctrl-q", "quit"),
 ]
 
@@ -504,6 +645,9 @@ class VagrantNetUI:
         self.cmd = TextArea(height=1, multiline=False, style="class:cmd",
                             accept_handler=self._accept_command)
         self.cmd_open = False
+        self.compose = TextArea(height=6, multiline=True, style="class:cmd",
+                                wrap_lines=True)
+        self.compose_open = False
         self.app: Application | None = None
 
     # ---------------- tab helpers -----------------------------------------
@@ -545,6 +689,75 @@ class VagrantNetUI:
                 return NotImplemented
             return None
         return handle
+
+    # ---------------- board sidebar ---------------------------------------
+    def _board_handler(self, board: str):
+        def handle(ev):
+            if ev.event_type == MouseEventType.MOUSE_UP:
+                self._spawn(self.shell.enter_board(board))
+                return None
+            return NotImplemented
+        return handle
+
+    def _sidebar(self) -> list:
+        sh = self.shell
+        out: list = [("class:side.title", " BOARDS\n")]
+        if not sh.board_order:
+            out.append(("class:side.dim", " (none yet)\n"))
+            out.append(("class:side.dim", "\n ctrl-b to\n load them\n"))
+            return out
+
+        here = sh._board_of(sh.current_path)
+        for i, name in enumerate(sh.board_order, start=1):
+            title = sh.boards.get(name, (name, 0))[0]
+            unread = sh.unread(name)
+            style = "class:side.active" if name == here else "class:side.board"
+            h = self._board_handler(name)
+            out.append((style, f" {i}. {title[:13]:<13}", h))
+            if unread:
+                out.append(("class:side.unread", f"{unread:>3}\n", h))
+            else:
+                out.append((style, "   \n", h))
+        out.append(("class:side.dim", "\n alt-<n> jump\n ctrl-p post\n"))
+        return out
+
+    def _compose_header(self) -> list:
+        sh = self.shell
+        board = sh._board_of(sh.current_path)
+        rest = (sh.current_path or "").strip("/")
+        in_thread = "/" in rest[len(page.BOARD_PREFIX) + 1:] if board else False
+        what = "reply" if in_thread else "new thread (first line is the subject)"
+        return [("class:compose.head",
+                 f" {what} in {board or '?'} as {sh.config.nick or '(set a nick)'}"
+                 "   ctrl-s send   esc cancel ")]
+
+    def _open_compose(self) -> None:
+        sh = self.shell
+        if sh._board_of(sh.current_path) is None:
+            self._emit("not in a board -- open one first")
+            return
+        if not sh.config.nick:
+            self._emit("set a name first:  nick <name>")
+            return
+        self.compose.text = ""
+        self.compose_open = True
+        self.app.layout.focus(self.compose)
+        self._refresh()
+
+    def _send_compose(self) -> None:
+        body = self.compose.text.strip()
+        self.compose_open = False
+        self._focus_content()
+        if not body:
+            return
+        sh = self.shell
+        rest = (sh.current_path or "").strip("/")[len(page.BOARD_PREFIX) + 1:]
+        in_thread = "/" in rest
+        if in_thread:
+            self._spawn(sh.post(body))
+        else:
+            subject, _, text = body.partition("\n")
+            self._spawn(sh.post(text.strip() or subject.strip(), subject.strip()))
 
     def _splash_lines(self) -> list[list]:
         h = self._handler()
@@ -773,7 +986,30 @@ class VagrantNetUI:
     # ---------------- wiring ----------------------------------------------
     def _bindings(self) -> KeyBindings:
         kb = KeyBindings()
-        insert = Condition(lambda: self.cmd_open)
+        composing = Condition(lambda: self.compose_open)
+        insert = Condition(lambda: self.cmd_open or self.compose_open)
+
+        @kb.add("c-b", filter=~insert)
+        def _(event): self._spawn(self.shell.open_boards())
+
+        @kb.add("c-p", filter=~insert)
+        def _(event): self._open_compose()
+
+        @kb.add("c-s", filter=composing, eager=True)
+        def _(event): self._send_compose()
+
+        @kb.add("escape", filter=composing, eager=True)
+        def _(event):
+            self.compose_open = False
+            self._focus_content()
+            self._refresh()
+
+        for n in range(1, 10):
+            @kb.add(f"escape", f"{n}", filter=~insert)
+            def _(event, n=n):
+                order = self.shell.board_order
+                if n <= len(order):
+                    self._spawn(self.shell.enter_board(order[n - 1]))
 
         @kb.add("c-q")
         def _(event): event.app.exit()
@@ -785,7 +1021,7 @@ class VagrantNetUI:
             event.app.layout.focus(self.cmd)
             self._refresh()
 
-        @kb.add("escape", filter=insert, eager=True)
+        @kb.add("escape", filter=Condition(lambda: self.cmd_open), eager=True)
         def _(event):
             self.cmd_open = False
             self._focus_content()
@@ -849,10 +1085,21 @@ class VagrantNetUI:
         self.content_control = FormattedTextControl(
             self._content, focusable=True, show_cursor=False)
         self.content_window = Window(self.content_control, wrap_lines=False)
+        sidebar = ConditionalContainer(
+            Window(FormattedTextControl(self._sidebar), width=21, style="class:side"),
+            filter=Condition(lambda: bool(self.shell.board_order)),
+        )
         layout = Layout(HSplit([
             Window(FormattedTextControl(self._tabbar), height=1, style="class:tabbar"),
-            self.content_window,
+            VSplit([sidebar, self.content_window]),
             Window(FormattedTextControl(self._status), height=1, style="class:status"),
+            ConditionalContainer(
+                HSplit([
+                    Window(FormattedTextControl(self._compose_header), height=1),
+                    self.compose,
+                ]),
+                filter=Condition(lambda: self.compose_open),
+            ),
             ConditionalContainer(
                 VSplit([
                     Window(FormattedTextControl([("class:cmd.prefix", " > ")]),

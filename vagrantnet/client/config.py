@@ -25,6 +25,8 @@ class ClientConfig:
     favorites: list[Favorite] = field(default_factory=list)
     # Flood our advert on connect. Needed to reach servers more than one hop away
     flood_advert: bool = False
+    nick: str = ""  # name posts are signed with
+    seen: dict[str, dict[str, int]] = field(default_factory=dict)
 
     @staticmethod
     def load(path: Path = DEFAULT_CONFIG_PATH) -> "ClientConfig":
@@ -43,6 +45,8 @@ class ClientConfig:
                 for f in raw.get("favorites", [])
             ],
             flood_advert=bool(raw.get("flood_advert", False)),
+            nick=raw.get("nick", ""),
+            seen={k: dict(v) for k, v in (raw.get("seen") or {}).items()},
         )
 
     def save(self) -> None:
@@ -55,12 +59,27 @@ class ClientConfig:
             },
             "servers": self.servers,
             "flood_advert": self.flood_advert,
+            "nick": self.nick,
+            "seen": self.seen,
             "favorites": [
                 {"server": f.server, "path": f.path, "label": f.label}
                 for f in self.favorites
             ],
         }
         self.path.write_text(json.dumps(raw, indent=2))
+
+    def mark_seen(self, server: str, board: str, seq: int) -> None:
+        board_seen = self.seen.setdefault(server, {})
+        if seq > board_seen.get(board, 0):
+            board_seen[board] = seq
+            self.save()
+
+    def last_seen(self, server: str, board: str) -> int:
+        return (self.seen.get(server) or {}).get(board, 0)
+
+    def set_nick(self, nick: str) -> None:
+        self.nick = nick
+        self.save()
 
     def resolve_server(self, name_or_pubkey: str) -> str:
         """A server can be referred to by its saved name or a raw pubkey hex."""

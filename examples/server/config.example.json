@@ -1,7 +1,12 @@
 {
-  "node_name": "vagrantNet Test Node",
+  "node_name": "vagrantNet Node",
   "pages_dir": "~/vn/pages",
   "downloads_dir": "~/vn/content",
+  "boards_dir": "~/vn/boards",
+  "enable_file_transfer": false,
+  "_enable_file_transfer": "false (default): refuse GET_FILE",
+  "enable_posting": true,
+  "_enable_posting": "true (default): accept board posts. false makes this a read-only node.",
   "connection": {
     "kind": "serial",
     "target": "/dev/ttyUSB0",

@@ -28,7 +28,9 @@ COLOURS = ("dim", "red", "green", "yellow", "blue", "magenta", "cyan", "white")
 DEFAULT_COLOUR = ""
 
 SERVER_DIRECTIVES = ("allow",)
+CLIENT_DIRECTIVES = ("seq", "bseq")  # read by the client
 FILES_LISTING_PATH = "files"  # server-generated listing of downloads_dir
+BOARD_PREFIX = "b"  # b, b/<board>, b/<board>:<seq> (new), b/<board>@<seq> (older)
 
 _ANSI_RESET = "\x1b[0m"
 _ANSI_BOLD = "\x1b[1m"
@@ -42,7 +44,31 @@ _ANSI_COLOUR = {
 
 def is_page_path(path: str) -> bool:
     p = (path or "").strip("/")
-    return p in ("", FILES_LISTING_PATH) or p.endswith(".vn")
+    return (p in ("", FILES_LISTING_PATH) or p.endswith(".vn")
+            or p == BOARD_PREFIX or p.startswith(BOARD_PREFIX + "/"))
+
+def board_seqs(vn_text: str) -> dict[str, int]:
+    # !bseq <board> <seq> on the index, so one fetch gives every unread count.
+    out: dict[str, int] = {}
+    for raw in vn_text.splitlines():
+        parts = raw.strip()[1:].split() if raw.strip().startswith("!") else []
+        if len(parts) > 2 and parts[0] == "bseq":
+            try:
+                out[parts[1]] = int(parts[2])
+            except ValueError:
+                continue
+    return out
+
+def seq(vn_text: str) -> int | None:
+    # Highest board sequence this page reflects, for tracking what's unread.
+    for raw in vn_text.splitlines():
+        parts = raw.strip()[1:].split() if raw.strip().startswith("!") else []
+        if len(parts) > 1 and parts[0] == "seq":
+            try:
+                return int(parts[1])
+            except ValueError:
+                return None
+    return None
 
 @dataclass
 class Link:
@@ -88,8 +114,8 @@ def parse(vn_text: str) -> list[Line]:
         if stripped.startswith("!"):
             parts = stripped[1:].split()
             name = parts[0] if parts else ""
-            if name in SERVER_DIRECTIVES:
-                continue  # stripped server-side already; drop if it slipped through
+            if name in SERVER_DIRECTIVES or name in CLIENT_DIRECTIVES:
+                continue
             if name == "c":
                 arg = parts[1].lower() if len(parts) > 1 else ""
                 colour = arg if arg in COLOURS else DEFAULT_COLOUR

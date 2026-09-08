@@ -31,6 +31,10 @@ SCAN_QUIET_SECONDS = 2.0  # contacts scan time
 def is_marked(name: str | None) -> bool:
     return bool(name) and MARKER in name
 
+def unmark(name: str | None) -> str:
+    # Node name without the server marker.
+    return (name or "").replace(MARKER, "").strip()
+
 def mark(name: str) -> str:
     # Add vNet marker
     if is_marked(name):

@@ -28,6 +28,7 @@ class Subcommand(IntEnum):
     GET_FILE = 1
     LIST_PAGES = 2
     CONTINUE = 3  # fetch next chunk of an already-started transfer, by token
+    POST = 4  # one chunk of a board post, client -> server
 
 class StatusCode(IntEnum):
     OK = 0
@@ -40,6 +41,15 @@ class StatusCode(IntEnum):
     # 7 is the last value the 3-bit status field can carry.
 
 REQ_FLAG_PREFER_COMPRESSED = 0b0001
+
+# subcmd_flags: bits 0-2 subcommand, bit 3 prefer-compressed, bit 4 upload
+# compressed (POST only), bits 5-7 attempt counter.
+REQ_FLAG_UPLOAD_COMPRESSED = 0b00010000
+
+# The mesh suppresses duplicate packets by hash to stop flood
+# This counter is to make all retry's different
+REQ_ATTEMPT_SHIFT = 5
+REQ_ATTEMPT_MASK = 0b111
 
 # status_flags packs StatusCode (bits 0-2) and these flags into one byte 
 # flags start at bit 3 to stay clear of it.
@@ -125,6 +135,12 @@ class Request:
     prefer_compressed: bool = True
     # Which compression dictionary this client has.
     dict_id: int = DICT_NONE
+    # POST only: how many chunks the whole post takes, and this chunk's slice
+    post_total_chunks: int | None = None
+    post_payload: bytes | None = None
+    post_checksum: int | None = None  # crc32 of the whole post, on chunk 0
+    upload_compressed: bool = False
+    attempt: int = 0  # retry counter, only so retries differ on the wire
 
     def encode(self) -> bytes:
         if len(self.client_pubkey_prefix) != PUB_KEY_PREFIX_LEN:
@@ -133,6 +149,9 @@ class Request:
             )
         flags = REQ_FLAG_PREFER_COMPRESSED if self.prefer_compressed else 0
         subcmd_flags = (int(self.subcommand) & 0b111) | ((flags & 0b1) << 3)
+        if self.upload_compressed:
+            subcmd_flags |= REQ_FLAG_UPLOAD_COMPRESSED
+        subcmd_flags |= (self.attempt & REQ_ATTEMPT_MASK) << REQ_ATTEMPT_SHIFT
 
         fixed = _REQ_FIXED.pack(
             _pack_ctrl(MsgType.REQUEST, self.dict_id),
@@ -146,6 +165,20 @@ class Request:
             if self.content_token is None:
                 raise EnvelopeError("CONTINUE requires content_token")
             tail = struct.pack("<B", self.content_token & 0xFF)
+        elif self.subcommand == Subcommand.POST:
+            body = self.post_payload or b""
+            if self.chunk_number == 0:
+                # only the first chunk names its destination
+                if self.path is None or self.post_total_chunks is None:
+                    raise EnvelopeError("POST chunk 0 requires path and post_total_chunks")
+                dest = self.path.encode("utf-8")
+                if len(dest) > 0xFF:
+                    raise EnvelopeError("POST path too long")
+                tail = struct.pack("<BIB", self.post_total_chunks & 0xFF,
+                                   (self.post_checksum or 0) & 0xFFFFFFFF,
+                                   len(dest)) + dest + body
+            else:
+                tail = body
         else:
             if self.path is None:
                 raise EnvelopeError(f"{self.subcommand.name} requires path")
@@ -168,7 +201,37 @@ class Request:
 
         subcommand = Subcommand(subcmd_flags & 0b111)
         prefer_compressed = bool((subcmd_flags >> 3) & 0b1)
+        upload_compressed = bool(subcmd_flags & REQ_FLAG_UPLOAD_COMPRESSED)
+        attempt = (subcmd_flags >> REQ_ATTEMPT_SHIFT) & REQ_ATTEMPT_MASK
         tail = data[REQ_FIXED_LEN:]
+
+        if subcommand == Subcommand.POST:
+            path = None
+            total = None
+            body = tail
+            checksum = None
+            if chunk_number == 0:
+                if len(tail) < 6:
+                    raise EnvelopeError("POST chunk 0 missing its header")
+                total, checksum, path_len = struct.unpack("<BIB", tail[:6])
+                if len(tail) < 6 + path_len:
+                    raise EnvelopeError("POST chunk 0 truncated path")
+                path = tail[6:6 + path_len].decode("utf-8", errors="strict")
+                body = tail[6 + path_len:]
+            return Request(
+                request_id=request_id,
+                client_pubkey_prefix=pubkey_prefix,
+                subcommand=subcommand,
+                chunk_number=chunk_number,
+                path=path,
+                prefer_compressed=prefer_compressed,
+                dict_id=dict_id,
+                post_total_chunks=total,
+                post_payload=body,
+                post_checksum=checksum,
+                upload_compressed=upload_compressed,
+                attempt=attempt,
+            )
 
         if subcommand == Subcommand.CONTINUE:
             if len(tail) < 1:
@@ -181,6 +244,7 @@ class Request:
                 content_token=tail[0],
                 prefer_compressed=prefer_compressed,
                 dict_id=dict_id,
+                attempt=attempt,
             )
 
         return Request(
@@ -191,6 +255,7 @@ class Request:
             path=tail.decode("utf-8", errors="strict"),
             prefer_compressed=prefer_compressed,
             dict_id=dict_id,
+            attempt=attempt,
         )
 
 # ------------ RESPONSE FORMAT ------------------------------------------------

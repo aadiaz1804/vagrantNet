@@ -11,9 +11,10 @@ import zlib
 from pathlib import Path
 
 from meshcore import EventType, MeshCore
-from ..common import chunking, compress, discovery, envelope, page, transport
+from ..common import chunking, compress, discovery, envelope, page, routing, transport
 from ..common.envelope import Request, Response, StatusCode, Subcommand
 from ..common.safepath import PathTraversalError, resolve_within
+from . import boards
 from .config import ServerConfig
 from .store import NoTokenAvailable, Transfer, TransferStore
 
@@ -35,12 +36,14 @@ class VagrantNetServer:
         self.mc: MeshCore | None = None
         config.pages_dir.mkdir(parents=True, exist_ok=True)
         config.downloads_dir.mkdir(parents=True, exist_ok=True)
+        config.boards_dir.mkdir(parents=True, exist_ok=True)
         self.store = TransferStore(
             ttl_seconds=config.content_token_ttl_seconds,
             linger_seconds=config.content_token_linger_seconds,
             max_total=config.max_in_flight_transfers_total,
             max_per_client=config.max_in_flight_transfers_per_client,
         )
+        self.uploads = boards.UploadStore()
         self._link_down = asyncio.Event()
         # pubkey hex -> contact record
         self._contacts: dict[str, dict] = {}
@@ -170,6 +173,24 @@ class VagrantNetServer:
                 logger.warning("contact refresh failed: %s", exc)
             await asyncio.sleep(CONTACT_REFRESH_SECONDS)
 
+    async def _learn_reply_path(self, prefix: bytes) -> None:
+        # Retrace the advert we heard from this client, once, and cache it.
+        want = prefix.hex().lower()
+        for key, contact in self._contacts.items():
+            if not key.lower().startswith(want):
+                continue
+            if int(contact.get("out_path_len", -1)) > 0:
+                return  # already routable
+            if contact.get("_advert_path_tried"):
+                return
+            contact["_advert_path_tried"] = True
+            found = await routing.advert_path(self.mc, key)
+            if found is not None:
+                contact["out_path"], contact["out_path_len"] = found
+                logger.info("learned a %d-hop reply path to %s from its advert",
+                            found[1], want)
+            return
+
     def _reply_path(self, prefix: bytes) -> bytes:
         # Route back to the client that sent this request.
         want = prefix.hex().lower()
@@ -291,6 +312,10 @@ class VagrantNetServer:
 
         logger.debug("request from %s: %s", req.client_pubkey_prefix.hex(), req.subcommand)
         try:
+            await self._learn_reply_path(req.client_pubkey_prefix)
+        except Exception:
+            logger.debug("reply-path lookup failed", exc_info=True)
+        try:
             await self._handle_request(req)
         except Exception:
             logger.exception("error handling request %s", req.request_id)
@@ -298,6 +323,9 @@ class VagrantNetServer:
     async def _handle_request(self, req: Request) -> None:
         if req.subcommand == Subcommand.CONTINUE:
             await self._handle_continue(req)
+            return
+        if req.subcommand == Subcommand.POST:
+            await self._handle_post(req)
             return
 
         try:
@@ -389,6 +417,124 @@ class VagrantNetServer:
             dict_id=transfer.dict_id,
         )
 
+    async def _ack_post(self, req: Request, status: StatusCode) -> None:
+        # Ack one POST chunk
+        await self._send_chunk(
+            req,
+            content_token=0,
+            chunk_number=req.chunk_number,
+            total_chunks=(req.post_total_chunks or 1),
+            chunk_payload=b"",
+            uncompressed_size=0,
+            compressed=False,
+            is_final=True,
+            checksum=None,
+            status=status,
+        )
+
+    async def _handle_post(self, req: Request) -> None:
+        if not self.config.enable_posting:
+            await self._ack_post(req, StatusCode.ACCESS_DENIED)
+            return
+
+        key = (req.client_pubkey_prefix, req.request_id)
+        if self.uploads.already_committed(key):
+            await self._ack_post(req, StatusCode.OK)  # ack a resend, don't post twice
+            return
+
+        if req.chunk_number == 0:
+            total = req.post_total_chunks or 1
+            if total > envelope.MAX_TOTAL_CHUNKS:
+                await self._ack_post(req, StatusCode.INVALID_REQUEST)
+                return
+            upload = self.uploads.begin(key, req.path or "", total,
+                                        req.upload_compressed, req.dict_id,
+                                        req.post_checksum or 0)
+            if upload is None:
+                await self._ack_post(req, StatusCode.ERROR)  # too many open
+                return
+        else:
+            upload = self.uploads.get(key)
+            if upload is None:
+                await self._ack_post(req, StatusCode.UNKNOWN_TOKEN)
+                return
+
+        if not upload.accept(req.chunk_number, req.post_payload or b""):
+            logger.warning("post chunk %d out of range (total %d) from %s",
+                           req.chunk_number, upload.total,
+                           req.client_pubkey_prefix.hex())
+            await self._ack_post(req, StatusCode.INVALID_REQUEST)
+            return
+        if not upload.complete:
+            await self._ack_post(req, StatusCode.OK)  # ack, keep going
+            return
+
+        body = upload.body()
+        if upload.checksum and zlib.crc32(body) != upload.checksum:
+            # Assembled wrong or arrived corrupt. Keep the upload so the
+            # client can resend the bad chunk instead of starting over.
+            logger.warning("post from %s failed its checksum, not storing",
+                           req.client_pubkey_prefix.hex())
+            await self._ack_post(req, StatusCode.INVALID_REQUEST)
+            return
+
+        self.uploads.done(key)
+        if upload.compressed:
+            try:
+                body = compress.decompress(body, dict_id=upload.dict_id)
+            except (compress.DictionaryMismatch, Exception) as exc:
+                logger.warning("post from %s failed to decompress: %s",
+                               req.client_pubkey_prefix.hex(), exc)
+                await self._ack_post(req, StatusCode.INVALID_REQUEST)
+                return
+
+        status = self._commit_post(req, upload.dest, body)
+        if status == StatusCode.OK:
+            self.uploads.mark_committed(key)
+        await self._ack_post(req, status)
+
+    def _commit_post(self, req: Request, dest: str, body: bytes) -> StatusCode:
+        if len(body) > boards.MAX_TEXT * 2:
+            return StatusCode.INVALID_REQUEST
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            return StatusCode.INVALID_REQUEST
+
+        # nick\nsubject\ntext for a new thread, nick\ntext for a reply
+        p = dest.strip("/")
+        if not p.startswith(page.BOARD_PREFIX + "/"):
+            return StatusCode.INVALID_REQUEST
+        rest = p[len(page.BOARD_PREFIX) + 1:]
+        name, _, thread_part = rest.partition("/")
+
+        thread = None
+        if thread_part:
+            try:
+                thread = int(thread_part)
+            except ValueError:
+                return StatusCode.INVALID_REQUEST
+
+        parts = text.split("\n", 2 if thread is None else 1)
+        nick = parts[0].strip() if parts else ""
+        if thread is None:
+            subject = parts[1].strip() if len(parts) > 1 else ""
+            content = parts[2] if len(parts) > 2 else ""
+        else:
+            subject = ""
+            content = parts[1] if len(parts) > 1 else ""
+        if not content.strip():
+            return StatusCode.INVALID_REQUEST
+
+        post = boards.append_post(
+            self.config.boards_dir, name, author=req.client_pubkey_prefix.hex(),
+            nick=nick, text=content, thread=thread, subject=subject,
+        )
+        if post is None:
+            return StatusCode.NOT_FOUND
+        logger.info("post to %s/%s by %s seq=%d", name, thread or "new", nick, post.seq)
+        return StatusCode.OK
+
     async def _handle_continue(self, req: Request) -> None:
         transfer = self.store.get(req.content_token)
         if transfer is None or transfer.client_pubkey_prefix != req.client_pubkey_prefix:
@@ -418,6 +564,9 @@ class VagrantNetServer:
 
     # ------------ content loading (path-safe) ----------------------------------
     def _load_content(self, req: Request) -> tuple[bytes, StatusCode]:
+        if req.subcommand == Subcommand.GET_FILE and not self.config.enable_file_transfer:
+            return b"", StatusCode.ACCESS_DENIED
+
         if req.subcommand == Subcommand.LIST_PAGES:
             listing = "# Available Pages\n\n"
             for page_file in sorted(self.config.pages_dir.glob("**/*.vn")):
@@ -433,7 +582,14 @@ class VagrantNetServer:
             return listing.encode("utf-8"), StatusCode.OK
 
         if req.subcommand == Subcommand.GET_PAGE and (req.path or "").strip("/") == page.FILES_LISTING_PATH:
+            if not self.config.enable_file_transfer:
+                return b"", StatusCode.ACCESS_DENIED
             return self._list_downloads(), StatusCode.OK
+
+        if req.subcommand == Subcommand.GET_PAGE:
+            board_page = self._load_board_page(req.path or "")
+            if board_page is not None:
+                return board_page
 
         root = (
             self.config.pages_dir
@@ -459,6 +615,57 @@ class VagrantNetServer:
         if not self._allowed(text, req.client_pubkey_prefix):
             return b"", StatusCode.ACCESS_DENIED
         return page.strip_server_directives(text).encode("utf-8"), StatusCode.OK
+
+    def _load_board_page(self, path: str) -> tuple[bytes, StatusCode] | None:
+        """Serve b, b/<board>[:seq] and b/<board>/<thread>. None if not a board path."""
+        p = path.strip("/")
+        if p != page.BOARD_PREFIX and not p.startswith(page.BOARD_PREFIX + "/"):
+            return None
+        root = self.config.boards_dir
+
+        rest = p[len(page.BOARD_PREFIX):].strip("/")
+        if not rest:
+            index = boards.render_index(boards.list_boards(root),
+                                        boards.board_seqs(root), root)
+            return index.encode("utf-8"), StatusCode.OK
+
+        head, _, thread_part = rest.partition("/")
+        # <board>:<seq> is catch-up, <board>@<seq> pages back through history
+        name, since_part, before_part = head, "", ""
+        if ":" in head:
+            name, _, since_part = head.partition(":")
+        elif "@" in head:
+            name, _, before_part = head.partition("@")
+        try:
+            since = int(since_part) if since_part else 0
+            before = int(before_part) if before_part else 0
+        except ValueError:
+            return b"", StatusCode.INVALID_REQUEST
+
+        board = boards.load_board(root, name)
+        if board is None:
+            return b"", StatusCode.NOT_FOUND
+
+        if not thread_part:
+            rendered = boards.render_threads(board, since, before)
+            return rendered.encode("utf-8"), StatusCode.OK
+
+        if thread_part == "archive":
+            return boards.render_archive(board).encode("utf-8"), StatusCode.OK
+        if thread_part.startswith("archive/"):
+            month = boards.render_month(board, thread_part[len("archive/"):])
+            if month is None:
+                return b"", StatusCode.NOT_FOUND
+            return month.encode("utf-8"), StatusCode.OK
+
+        try:
+            thread = int(thread_part)
+        except ValueError:
+            return b"", StatusCode.INVALID_REQUEST
+        rendered = boards.render_thread(board, thread, since)
+        if rendered is None:
+            return b"", StatusCode.NOT_FOUND
+        return rendered.encode("utf-8"), StatusCode.OK
 
     def _list_downloads(self) -> bytes:
         listing = "# Files\n\n"

@@ -12,17 +12,13 @@ markup, compressed with a dictionary trained on that markup, and sent in
 
 Example Render:
 ```
-═══ WELCOME TO VAGRANTNET ═══
+═══ EXAMPLE NODE ═══
 
-This is a test node running the vagrantNet reference daemon.
+A vagrantNet server.
 
-ABOUT
-
-vagrantNet serves pages and files over MeshCore's raw-data transport,
-point-to-point, without broadcasting to a channel.
-
-  [1] Files  (files)
-  [2] Help   (help.vn)
+  [1] Message board     (b)
+  [2] Page format       (help.vn)
+  [3] About this node   (about.vn)
 ```
 
 ## Feature-set
@@ -102,11 +98,11 @@ cp config.example.json config.json   # remember to update the config
 python -m vagrantnet.server.server config.json
 ```
 
-Drop `.vn` files in `pages_dir` and they are served. Drop anything else in
-`downloads_dir` and it shows up in the `[Files|files]` listing every page can
-link to. Keep separate as `.vn` files in `downloads_dir` gets
-listed but a client will try to fetch it as a page and get NOT_FOUND, since
-paths ending in `.vn` are resolved against `pages_dir`.
+Drop `.vn` files in `pages_dir` and they are served. Make a directory under
+`boards_dir` with a `meta.json` and it becomes a board. There is a working
+set of both in [`examples/`](examples/README.md),
+
+File transfer is off by default (`enable_file_transfer`) Turn it on only for a private or offgrid mesh.
 
 `"target": "auto"` makes the server find its own radio by asking each USB
 serial port which one answers the companion protocol. It picks the first port that answers, you can also give an explicit path if you have two radios on one host and the path does not change.
@@ -154,19 +150,89 @@ Malformed lines (including a typo'd `!directive`) render as plain text.
 `!allow` is processed server-side. It's matched against
 the 6-byte pubkey prefix a request carries on the wire.
 
-A link whose path doesn't end in `.vn` is a file clients fetch it
-with GET_FILE and save it instead of rendering it. `[Files|files]` is always
-available and lists whatever is in `downloads_dir`.
+Links reach boards too: `b` is the board list, `b/<board>` its threads,
+`b/<board>/<n>` one thread, `b/<board>/archive` browses by month.
+
+A link whose path doesn't end in `.vn` and isn't a board path names a file --
+fetched with GET_FILE and saved rather than rendered, when file transfer is
+enabled.
 ```
 
 Check what a page will actually cost before publishing it:
 
 ```sh
 $ python -m vagrantnet.common.page pages/index.vn
-pages/index.vn: 169 bytes on the wire (compressed), 2 chunk(s), ~1.2s to fetch, 2 link(s)
+pages/index.vn: 132 bytes on the wire (compressed), 1 chunk(s),
+                0.8s airtime (0.01% of the mesh's day), 3 link(s)
 ```
 
 Every chunk is another round trip keep that in mind sometimes dividing pages into links is better than cramming everything on index.vn
+
+### Running boards & content
+
+A working example is included in the repo three pages and two boards. Copy them where your
+`config.json` points, then start the daemon.
+
+```sh
+cp examples/server/config.example.json config.json   # then edit the paths
+cp -r examples/pages/*  ~/vn/pages/
+cp -r examples/boards/* ~/vn/boards/
+python -m vagrantnet.server.server config.json
+```
+
+## What maps where
+
+| config key     | holds                        | here                |
+|----------------|------------------------------|---------------------|
+| `pages_dir`    | `.vn` pages, served by name  | `pages/`            |
+| `boards_dir`   | boards, one directory each   | `boards/`           |
+| `downloads_dir`| files (off by default)       | --                  |
+
+## Pages
+
+Static text. `index.vn` is what `open <server>` fetches. `help.vn` is the
+whole page syntax, `about.vn` is prose. Links between them are just
+`[Label|file.vn]`.
+
+## Boards
+
+A board is a directory under `boards_dir`:
+
+```
+boards/
+  motd.vn                 shown above the board list (optional)
+  general/
+    meta.json             { "title": ..., "desc": ... }
+    pinned.vn             shown above the threads (optional)
+    posts.jsonl           created on the first post
+```
+
+Readers reach them at `b` (the list), `b/general` (threads),
+`b/general/<n>` (one thread). `b/general/archive` browses by month.
+
+Nothing needs creating by hand except `meta.json` -- the log appears when
+someone posts.
+
+## Posting as the operator
+
+```sh
+python -m vagrantnet.server.post config.json announcements "Net tonight" \
+    -m "8pm, all welcome."
+echo "repeater back up" | python -m vagrantnet.server.post config.json general "Status"
+python -m vagrantnet.server.post config.json general --thread 4 -m "still down"
+```
+
+## Before you publish a page (publicly)
+
+Airtime is shared, so check what a page costs:
+
+```sh
+$ python -m vagrantnet.common.page pages/index.vn
+pages/index.vn: 169 bytes on the wire (compressed), 2 chunk(s),
+                1.6s airtime (0.01% of the mesh's day), 3 link(s)
+```
+
+Under 2KB and 5s is the guideline to keep it under 1 flood advert. 
 
 ## How discovery works
 

@@ -1,0 +1,30 @@
+# Page Format
+
+A .vn page is plain text. Check readme for the whole syntax.
+
+## Links
+
+Written as label, pipe, path, in square brackets. These three are real:
+
+[About|about.vn]
+> a page in pages_dir, by filename
+
+[BBS Main|b]
+> b is the boards, b/name is one board, b/name/12 is a thread
+
+[BBS General|b/general]
+> a link is only a link if the whole line is one
+
+## Directives 
+
+(Note: Remove _ for functioning directives)
+
+!c cyan
+The directive !_c <colour> applies to the lines after it, until the next !_c
+!c
+
+!_allow KEY restricts a page to listed keys. Stripped before sending, 6-byte pKey is used
+
+Anything else is a paragraph. A malformed line renders as plain text.
+
+[Back|index.vn]

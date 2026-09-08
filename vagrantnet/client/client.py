@@ -11,7 +11,7 @@ import zlib
 from dataclasses import dataclass
 
 from meshcore import EventType, MeshCore
-from ..common import chunking, compress, discovery, transport
+from ..common import chunking, compress, discovery, envelope, routing, transport
 from ..common.envelope import (
     EnvelopeError,
     Request,
@@ -275,6 +275,10 @@ class VagrantNetClient:
             if attempt < CONTACT_LOOKUP_MAX_ATTEMPTS:
                 await asyncio.sleep(CONTACT_LOOKUP_RETRY_DELAY_SECONDS)
         else:
+            # No stored route. Use heard advert
+            found = await routing.advert_path(self.mc, server_pubkey_hex)
+            if found is not None:
+                return bytes.fromhex(found[0]), found[1]
             raise VagrantNetError(
                 f"Server {server_pubkey_hex[:12]}... has no known path yet -- "
                 "wait for a server/repeater advert before fetching"
@@ -316,9 +320,17 @@ class VagrantNetClient:
                 logger.info(
                     "send_raw_data: request_id=%s attempt %d", req.request_id, attempt
                 )
-                await self.mc.commands.send_raw_data(req.encode(), path=server_path)
+                req.attempt = attempt
+                sent = await self.mc.commands.send_raw_data(
+                    req.encode(), path=server_path)
+                # Work with a refused send
+                if sent is not None and sent.type == EventType.ERROR:
+                    raise VagrantNetError(f"radio refused the send: {sent.payload}")
                 resp = await asyncio.wait_for(fut, timeout=timeout)
                 return resp
+            except VagrantNetError as e:
+                last_error = e
+                logger.warning("request_id=%s attempt %d: %s", req.request_id, attempt, e)
             except EnvelopeError:
                 raise  # unencodable frame
             except Exception as e:
@@ -421,6 +433,70 @@ class VagrantNetClient:
 
         return body
 
+    async def post(self, server_pubkey_hex: str, dest: str, nick: str,
+                   text: str, subject: str = "") -> None:
+        # Send a board post. dest is b/<board> for a new thread, b/<board>/<n> to reply.
+        # resend overwrites its slot rather than posting twice.
+        server_path, hops = await self._resolve_path(server_pubkey_hex)
+        timeout = _chunk_timeout(hops)
+        own_prefix = self._own_pubkey_prefix()
+
+        head = f"{nick}\n{subject}\n" if subject else f"{nick}\n"
+        raw = (head + text).encode("utf-8")
+        packed, dict_id = compress.compress(raw)
+        use_packed = len(packed) < len(raw)
+        payload = packed if use_packed else raw
+        checksum = zlib.crc32(payload)
+
+        # chunk 0 header: total_chunks(1) checksum(4) path_len(1) + the path
+        first_room = (envelope.MAX_SAFE_PAYLOAD - envelope.REQ_FIXED_LEN
+                      - 6 - len(dest.encode()))
+        rest_room = envelope.MAX_SAFE_PAYLOAD - envelope.REQ_FIXED_LEN
+        if first_room <= 0:
+            raise VagrantNetError(f"destination {dest!r} is too long")
+        slices = [payload[:first_room]]
+        pos = first_room
+        while pos < len(payload):
+            slices.append(payload[pos:pos + rest_room])
+            pos += rest_room
+
+        req_id = random.randint(0, 0xFFFF)
+        n = 0
+        restarts = 0
+        while n < len(slices):
+            slice_ = slices[n]
+            req = Request(
+                request_id=req_id,
+                client_pubkey_prefix=own_prefix,
+                subcommand=Subcommand.POST,
+                chunk_number=n,
+                path=dest if n == 0 else None,
+                post_total_chunks=len(slices) if n == 0 else None,
+                post_checksum=checksum if n == 0 else None,
+                post_payload=slice_,
+                upload_compressed=use_packed,
+                dict_id=dict_id if use_packed else compress.DICT_NONE,
+            )
+            resp = await self._send_and_wait(server_path, req, timeout)
+
+            if resp.status == StatusCode.UNKNOWN_TOKEN and n > 0:
+                # The server dropped the partial post, safe retry
+                restarts += 1
+                if restarts > 2:
+                    raise VagrantNetError("server keeps losing the post, giving up")
+                logger.warning("server lost the partial post, restarting it")
+                req_id = random.randint(0, 0xFFFF)
+                n = 0
+                continue
+            if resp.status != StatusCode.OK:
+                raise VagrantNetError(
+                    f"post rejected at chunk {n + 1}/{len(slices)}: {resp.status.name}"
+                )
+            if resp.chunk_number != n:
+                logger.warning("ack was for chunk %d, expected %d",
+                               resp.chunk_number, n)
+            n += 1
+
 LOG_FORMAT = "%(asctime)s.%(msecs)03d %(name)s %(levelname)s %(message)s"
 LOG_DATEFMT = "%H:%M:%S"
 
@@ -441,12 +517,32 @@ async def _main(argv: list[str]) -> None:
     if len(positional) < 3:
         print(
             "usage: python -m vagrantnet.client.client <serial-port|ble-address> "
-            "<server-pubkey-hex> <get-page|get-file|list-pages> [path] [--pin=XXXXXX]"
+            "<server-pubkey-hex> <get-page|get-file|list-pages|post> [args] [--pin=XXXXXX]"
         )
         sys.exit(1)
 
     port, server_key, cmd_str = positional[0], positional[1], positional[2]
     path = positional[3] if len(positional) > 3 else ""
+
+    if cmd_str == "post":
+        # post <dest> <nick> <subject|-> [text]; text from stdin if omitted
+        if len(positional) < 6:
+            print("usage: ... post <b/board[/thread]> <nick> <subject|-> [text]")
+            sys.exit(1)
+        dest, nick, subject = positional[3], positional[4], positional[5]
+        text = " ".join(positional[6:]) if len(positional) > 6 else sys.stdin.read()
+        client = (
+            await VagrantNetClient.connect_ble(port, pin=pin)
+            if _BLE_ADDRESS_RE.match(port)
+            else await VagrantNetClient.connect_serial(port)
+        )
+        try:
+            await client.post(server_key, dest, nick, text.strip(),
+                              "" if subject == "-" else subject)
+            print(f"posted to {dest}")
+        finally:
+            await client.disconnect()
+        return
 
     subcommand = {
         "get-page": Subcommand.GET_PAGE,
