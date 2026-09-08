@@ -37,8 +37,11 @@ A vagrantNet server.
   500 randomized pages and tool utility included for future multi-language support.
 - **Hidden nodes:** A server can serve normally while not advertising so only
   users with the pKey can connect.
-- **Runs unattended:** Auto radio discovery (best-effor), survives the radio being
+- **Runs unattended:** Auto radio discovery (best-effort), survives the radio being
   unplugged, and stops cleanly on SIGTERM. A systemd unit is included as an example deployment on Linux.
+
+## Demo
+![vagrantNet demo](_media/demo.gif)
 
 ## Requirements
 

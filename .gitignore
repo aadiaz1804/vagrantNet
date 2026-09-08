@@ -10,10 +10,7 @@ des
 *egg-info*
 build/
 dist/
-
-# Node data: pages, boards and config a running server owns. Bind-mounted by
-# docker-compose into the working directory, so it must never be tracked and
-# must survive a git clean.
+# Node data
 vn/
 # Where the client saves downloads.
 downloads/
