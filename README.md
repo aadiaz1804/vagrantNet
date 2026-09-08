@@ -49,6 +49,9 @@ A vagrantNet server.
 
 ## Getting started
 
+### Docker
+See [Hosting](#hosting-server). One command, ships with example content.
+
 ### Build from source
 
 ```sh
@@ -56,8 +59,6 @@ git clone https://github.com/aadiaz1804/vagrantNet
 cd vagrantNet
 python3 -m venv .venv && .venv/bin/pip install -e .
 ```
-### Binaries & Docker
-Docker and multi-OS support WIP
 
 ### Browsing (Client)
 
@@ -93,21 +94,34 @@ python -m vagrantnet.client.client <port|ble-addr> <server-pubkey> get-page inde
 
 ### Hosting (Server)
 
+#### Docker
+
+Docker is the easiest way to run a node. One command, and it comes up with
+the example pages and boards already in place.
+
 ```sh
-cp config.example.json config.json   # remember to update the config
-python -m vagrantnet.server.server config.json
+git clone https://github.com/aadiaz1804/vagrantNet && cd vagrantNet
+# edit docker-compose.yml: set VN_NODE_NAME and VN_RADIO to your device
+docker compose up -d
 ```
+That is the whole install. Your content lands in `./vn/` on the host
+`vn/pages/` for pages, `vn/boards/` for boards write your own and restart.
+Pulling a newer image never overwrites.
 
-Drop `.vn` files in `pages_dir` and they are served. Make a directory under
-`boards_dir` with a `meta.json` and it becomes a board. There is a working
-set of both in [`examples/`](examples/README.md),
+Settings are environment variables, so the node is described on docker-compose.yml:
+| variable | default | |
+|---|---|---|
+| `VN_NODE_NAME` | `vagrantNet Node` | what the mesh sees |
+| `VN_RADIO` | `auto` | `/dev/ttyUSB0`, `auto`, a BLE MAC, or `host:port` |
+| `VN_ADVERT_HOURS` | `24` | Hours before advert to mesh |
+| `VN_ENABLE_POSTING` | `true` | false makes a read-only node |
+| `VN_ENABLE_FILE_TRANSFER` | `false` | Only for private mesh use!!! |
+| `VN_UID` / `VN_GID` | `1000` | who owns `./vn` set to your own `id -u` |
 
-File transfer is off by default (`enable_file_transfer`) Turn it on only for a private or offgrid mesh.
+**A USB radio has to be handed to the container explicitly** in the
+`devices:` line in the compose file, and it has to match `VN_RADIO`. Unfortunately that makes USB/BLE serial only work Linux as Docker Desktop on macOS and Windows cannot pass a USB serial port into a container at all. On those, run the radio over TCP and point `VN_RADIO` at it, or run the server outside Docker.
 
-`"target": "auto"` makes the server find its own radio by asking each USB
-serial port which one answers the companion protocol. It picks the first port that answers, you can also give an explicit path if you have two radios on one host and the path does not change.
-
-### Running it as a daemon (Server headless continuous run)
+#### Manual install
 
 The server retries a lost radio on its own, rebuilds a link that goes silent,
 and answers SIGTERM so systemd only has to start it and restart it if crashes. A unit file example ships at
@@ -130,6 +144,19 @@ journalctl -u vagrantnet -f
 The `dialout` group is what grants access to `/dev/tty*`; without it the
 server cannot open the radio. A healthy server logs a heartbeat every 60s and
 rebuilds its routing table every 15 minutes.
+
+```sh
+cp examples/server/config.example.json config.json   # then edit the paths
+python -m vagrantnet.server.server config.json
+```
+
+Drop `.vn` files in `pages_dir` and they are served. Make a directory under
+`boards_dir` with a `meta.json` and it becomes a board. There is a working
+set of both in [`examples/`](examples/README.md).
+
+`"target": "auto"` makes the server find its own radio by asking each USB
+serial port which one answers the companion protocol. It picks the first that
+answers; give an explicit path if you have two radios on one host.
 
 ## Writing pages
 

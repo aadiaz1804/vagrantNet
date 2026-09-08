@@ -1,0 +1,26 @@
+services:
+  vagrantnet:
+    build: .
+    image: vagrantnet:latest
+    container_name: vagrantnet
+    restart: unless-stopped
+
+    environment:
+      VN_NODE_NAME: "My vagrantNet Node"
+      # Serial device path, "auto" to find it, or host:port for a TCP radio.
+      VN_RADIO: "/dev/ttyUSB0"
+      # One flood advert costs the mesh about 12 seconds of shared airtime.
+      VN_ADVERT_HOURS: "24"
+      VN_ENABLE_POSTING: "true"
+      # Private meshes only.
+      VN_ENABLE_FILE_TRANSFER: "false"
+
+    # Your pages and boards. Seeded from the examples on first run, yours
+    # afterwards. Gitignored, so a git clean will not take your board with it
+    # -- but back it up like any other content you care about.
+    volumes:
+      - ./vn:/data
+
+    # A USB radio has to be handed in explicitly. Match VN_RADIO above.
+    devices:
+      - "/dev/ttyUSB0:/dev/ttyUSB0"
