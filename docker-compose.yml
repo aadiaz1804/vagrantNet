@@ -5,6 +5,8 @@ services:
     container_name: vagrantnet
     restart: unless-stopped
 
+    # These are read once at startup: change them, then `docker compose up -d`.
+    # Pages and boards in the volume are read per request and need no restart.
     environment:
       VN_NODE_NAME: "My vagrantNet Node"
       # Serial device path, "auto" to find it, or host:port for a TCP radio.

@@ -49,7 +49,7 @@ def seed() -> None:
                 shutil.copytree(item, target)
             else:
                 shutil.copy2(item, target)
-        print(f"seeded {name}/ with the examples")
+        print(f"seeded {name}/ with the examples", flush=True)
     (DATA / "content").mkdir(parents=True, exist_ok=True)
 
 def write_config() -> Path:
@@ -98,8 +98,10 @@ def drop_privileges(device: str | None) -> None:
         os.setgroups(groups)
         os.setgid(gid)
         os.setuid(uid)
+        # flush: execvp replaces this process and takes the buffer with it
         print(f"running as {uid}:{gid}"
-              + (f" (+group {groups[0]} for {device})" if groups else ""))
+              + (f" (+group {groups[0]} for {device})" if groups else ""),
+              flush=True)
     except OSError as exc:
         print(f"could not drop privileges: {exc}", file=sys.stderr)
 

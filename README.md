@@ -104,9 +104,10 @@ git clone https://github.com/aadiaz1804/vagrantNet && cd vagrantNet
 # edit docker-compose.yml: set VN_NODE_NAME and VN_RADIO to your device
 docker compose up -d
 ```
-That is the whole install. Your content lands in `./vn/` on the host
-`vn/pages/` for pages, `vn/boards/` for boards write your own and restart.
-Pulling a newer image never overwrites.
+That is the whole install. Your content lands in `./vn/` on the host `vn/pages/` for pages, `vn/boards/` for boards. Write your own. Pulling a newer image never overwrites them.
+
+**Pages and boards are read from disk on every request, so edits go live immediately** Only the settings below are read once at startup `docker compose up -d`.
+
 
 Settings are environment variables, so the node is described on docker-compose.yml:
 | variable | default | |
