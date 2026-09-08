@@ -741,6 +741,8 @@ class VagrantNetUI:
 
     def _here(self) -> str:
         # The path the active tab is showing, or heading for while it loads.
+        # Tabs hold their own page; the Shell only tracks the last one fetched.
+        t = self.tab
         return (t.loading_path if t.loading and t.loading_path else t.path) or ""
 
     def _target_tab(self) -> Tab | None:
