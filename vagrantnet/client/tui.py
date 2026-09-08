@@ -660,8 +660,11 @@ SPLASH_COMMANDS = [
     ("ls [server]",            "list public server files"),
     ("server add <name> <pk>", "save a server by name"),
     ("connect <port|addr>",    "attach to a radio"),
-    ("discover",               "find servers already heard (free)"),
+    ("discover",               "find servers already heard"),
 ]
+
+# Shown in the status bar at all times, so the splash leaves them out.
+STATUS_KEYS = ("ctrl-e", "ctrl-g", "ctrl-q")
 
 KEYS_HELP = [
     ("ctrl-e", "command"), ("ctrl-g", "help"), ("ctrl-t", "new tab"),
@@ -912,10 +915,12 @@ class VagrantNetUI:
                         else f"{f.kind}, {where} -- not saved")
                 click = self._open_server_handler(saved) if saved else h
                 style = "class:page.link" if saved else "class:splash.text"
+                pad = " " * max(1, 22 - len(label))
                 row([("class:splash.dim", "          ", click),
                      ("class:page.linknum", f"{i}. ", click),
-                     (style, f"{label:<22}", click),
-                     ("class:splash.dim", note, click)])
+                     # Padding kept out of the link style
+                     (style, label, click),
+                     ("class:splash.dim", pad + note, click)])
                 if not saved:
                     row([("class:splash.dim",
                           "             type  discover  for its key", h)])
@@ -932,9 +937,21 @@ class VagrantNetUI:
         if not servers and not favs:
             row([("class:splash.dim", "        no servers saved", h)])
         row([])
-        row([("class:splash.dim", "        ", h)] +
-            [frag for k, w in KEYS_HELP for frag in
-             (("class:splash.key", k, h), ("class:splash.dim", f" {w}   ", h))])
+        cols = self.app.output.get_size().columns if self.app else 80
+        line: list = [("class:splash.dim", "        ", h)]
+        width = 8
+        for k, w in KEYS_HELP:
+            if k in STATUS_KEYS:
+                continue
+            cell = len(k) + len(w) + 4
+            if width + cell > cols - 2 and len(line) > 1:
+                row(line)
+                line, width = [("class:splash.dim", "        ", h)], 8
+            line += [("class:splash.key", k, h),
+                     ("class:splash.dim", f" {w}   ", h)]
+            width += cell
+        if len(line) > 1:
+            row(line)
         return lines
 
     def _page_lines(self) -> list[list]:
@@ -979,15 +996,22 @@ class VagrantNetUI:
 
     def _lines(self) -> list[list]:
         t = self.tab
-        if t.loading:
-            what = t.loading_path or t.path or ""
-            return [[], [("class:splash.dim", f"  fetching {what} …", self._handler())]]
-        if t.empty:
-            return self._splash_lines()
-        lines = self._page_lines() if t.text else []
-        if t.messages:
-            if lines:
+        what = t.loading_path or t.path or ""
+        if t.text:
+            if t.loading:
+                return [[], [("class:splash.dim", f"  fetching {what} …",
+                              self._handler())]]
+            lines = self._page_lines()
+        else:
+            # No page yet, so the start screen stands
+            # Radio chatter goes underneath
+            lines = self._splash_lines()
+            if t.loading:
                 lines.append([])
+                lines.append([("class:splash.dim", f"  fetching {what} …",
+                               self._handler())])
+        if t.messages:
+            lines.append([])
             lines.extend([[(style, "  " + text, self._handler())] for style, text in t.messages])
         return lines
 
