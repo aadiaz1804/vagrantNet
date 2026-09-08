@@ -91,6 +91,17 @@ class ClientConfig:
         self.last_connection_pin = pin
         self.save()
 
+    def name_for(self, pubkey_hex: str) -> str | None:
+        # Short key names for what `open` actually takes.
+        key = (pubkey_hex or "").lower()
+        if not key:
+            return None
+        for name, pub in self.servers.items():
+            p = (pub or "").lower()
+            if p and (key.startswith(p) or p.startswith(key)):
+                return name
+        return None
+
     def add_server(self, name: str, pubkey_hex: str) -> None:
         self.servers[name] = pubkey_hex
         self.save()

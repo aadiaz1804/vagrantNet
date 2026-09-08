@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..common import page
+
 BOARD_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
 POSTS_FILE = "posts.jsonl"
 META_FILE = "meta.json"
@@ -218,7 +220,17 @@ def _read_notice(path: Path) -> list[str]:
                 break
             kept.append(line)
         raw = "\n".join(kept)
-    return [l for l in raw.splitlines() if l.strip()]
+    lines = [l for l in raw.splitlines() if l.strip()]
+
+    # Close a colour the operator left open.
+    open_colour = False
+    for line in lines:
+        name, args = page.directive(line)
+        if name == page.COLOUR_DIRECTIVE:
+            open_colour = bool(args)
+    if open_colour:
+        lines.append("!c")
+    return lines
 
 def _ago(then: float, now: float | None = None) -> str:
     secs = max(0, int((now if now is not None else time.time()) - then))

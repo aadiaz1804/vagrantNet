@@ -8,6 +8,7 @@ import logging
 import re
 import shlex
 import sys
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -41,6 +42,8 @@ HISTORY_PATH = DEFAULT_CONFIG_PATH.parent / "shell_history"
 _BLE_ADDRESS_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 
 DOWNLOAD_DIR = Path("downloads")  # relative
+# Pseudo-path for the page listing, so it can be reloaded and gone back to.
+LISTING_PATH = ":pages"
 
 def _safe_download_path(server_path: str) -> Path | None:
     # Link is server-supplied confined to DOWNLOAD_DIR and refuse escapes
@@ -63,6 +66,7 @@ server rm <name>                          forget a saved server
 open <server> [path]                      fetch and render a page (default: index.vn)
 boards [server]                           open the board list
 b <name>                                  enter a board (or click it in the sidebar)
+home                                      leave the boards for the server's index
 post <text>                               reply in the open thread
 post <subject> | <text>                   start a thread in the open board
 nick <name>                               override the name posts are signed with
@@ -78,6 +82,18 @@ fav rm <n>                                forget favorite <n>
 fav <n>                                   open favorite <n>
 help                                      show this text
 quit / exit                               leave
+"""
+
+# Only meaningful with a board open, so it is appended to the help then.
+BOARD_HELP = """\
+post <text>                               reply in the open thread
+post <subject> | <text>                   start a thread in this board
+b <name>                                  switch to another board
+back                                      leave a thread / the board
+home                                      leave the boards altogether
+b/<board>:<seq>                           only what arrived after <seq>
+b/<board>/<thread>                        one thread, :<seq> pages forward
+b/<board>/archive                         browse the board by month
 """
 
 class Shell:
@@ -122,12 +138,7 @@ class Shell:
         self.emit("connected.")
 
     def _adopt_radio_name(self) -> None:
-        """Post under the name the radio already advertises.
-
-        MeshCore has no separate nickname: set_name() is what goes out in the
-        advert and what everyone else sees you as. Asking for it again would
-        just invite a second, inconsistent identity.
-        """
+        # Post under the name the radio already advertises.
         if self.config.nick or self.client is None:
             return
         name = discovery.unmark((self.client.mc.self_info or {}).get("name"))
@@ -155,6 +166,9 @@ class Shell:
     async def open_page(self, server: str, path: str, *, push_history: bool = True) -> None:
         client = self._require_client()
         if client is None:
+            return
+        if path == LISTING_PATH:
+            await self.list_pages(server, push_history=push_history)
             return
         pubkey = self._resolve_server(server)
 
@@ -238,6 +252,23 @@ class Shell:
         head = p[len(page.BOARD_PREFIX) + 1:].partition("/")[0]
         return head.partition(":")[0].partition("@")[0] or None
 
+    def in_boards(self, path: str | None = None) -> bool:
+        # True on the board list and anywhere inside a board.
+        p = ((self.current_path if path is None else path) or "").strip("/")
+        return p == page.BOARD_PREFIX or p.startswith(page.BOARD_PREFIX + "/")
+
+    async def home(self) -> None:
+        # Leave the boards behind for the server's front page.
+        if self.current_server is None:
+            self.emit("no server, try: open <server>")
+            return
+        await self.open_page(self.current_server, "index.vn")
+
+    def help_text(self) -> str:
+        if not self.in_boards():
+            return HELP_TEXT
+        return f"{HELP_TEXT}\nin a board:\n\n{BOARD_HELP}"
+
     async def post(self, text: str, subject: str = "") -> None:
         """Post to the open board. Replies if a thread is open, else new thread."""
         client = self._require_client()
@@ -292,10 +323,20 @@ class Shell:
                       "set advertise_as_server for it to be findable")
             return
         self.emit(f"{len(self.found)} vagrantNet server(s):")
+        unsaved = 0
         for i, f in enumerate(self.found, start=1):
             where = f"{f.hops} hop(s)" if f.reachable else "no path yet"
-            self.emit(f"  [{i}] {f.name}  ({f.kind}, {where})  {f.pubkey[:12]}...")
-        self.emit("use: server add <name> <pubkey>   then: open <name>")
+            saved = self.config.name_for(f.pubkey)
+            if saved:
+                # Show the name `open` takes, not just the advertised one.
+                self.emit(f"  [{i}] {saved}  (as {f.name}, {f.kind}, {where})"
+                          f"   open {saved}")
+            else:
+                unsaved += 1
+                self.emit(f"  [{i}] {f.name}  ({f.kind}, {where})")
+                self.emit(f"      server add <name> {f.pubkey}")
+        if unsaved:
+            self.emit("copy a line above, pick a short name, then: open <name>")
 
     def _print_page(self, server, path, text, links) -> None:
         print(render_ansi(text))
@@ -321,7 +362,7 @@ class Shell:
         server, path = self.nav_stack.pop()
         await self.open_page(server, path, push_history=False)
 
-    async def list_pages(self, server: str | None) -> None:
+    async def list_pages(self, server: str | None, *, push_history: bool = True) -> None:
         client = self._require_client()
         if client is None:
             return
@@ -335,7 +376,14 @@ class Shell:
         except VagrantNetError as e:
             self.emit(f"list-pages failed: {e}")
             return
-        self.emit(render_ansi(body.decode("utf-8", errors="replace")))
+        # A listing is a .vn page, so show it as one: its links are clickable.
+        text = body.decode("utf-8", errors="replace")
+        if push_history and self.current_server is not None and self.current_path is not None:
+            self.nav_stack.append((self.current_server, self.current_path))
+        self.current_server = target
+        self.current_path = LISTING_PATH
+        self.current_links = extract_links(text)
+        self.show_page(target, LISTING_PATH, text, self.current_links)
 
     async def get_file(self, path: str) -> None:
         client = self._require_client()
@@ -422,7 +470,7 @@ class Shell:
         if cmd in ("quit", "exit"):
             return False
         elif cmd == "help":
-            self.emit(HELP_TEXT)
+            self.emit(self.help_text())
         elif cmd == "connect":
             if not args:
                 self.emit("usage: connect <serial-port|ble-address> [pin]")
@@ -450,6 +498,8 @@ class Shell:
                 self.emit("usage: b <board>")
             else:
                 await self.enter_board(args[0])
+        elif cmd == "home":
+            await self.home()
         elif cmd == "nick":
             if not args:
                 self.emit(f"nick is {self.config.nick!r}" if self.config.nick
@@ -507,6 +557,7 @@ def _completer() -> NestedCompleter:
             "open": None,
             "boards": None,
             "b": None,
+            "home": None,
             "nick": None,
             "post": None,
             "go": None,
@@ -556,10 +607,16 @@ async def repl_main() -> None:
 # ============================ full-screen UI ============================
 # REPL is still the engine. Tabs, a Ctrl-key command prompt instead of a modal language, 
 # mouse support, and a start screen goes through Shell.run_command().
+# The toolbar's fixed cells, kept here so its width can be measured.
+TOOLBAR_LABELS = " \u2190   \u21bb   \u2302   B   "
+
 VN_STYLE = Style.from_dict({
     "tabbar":          "bg:#1c1c2b",
     "tabbar.tab":      "bg:#1c1c2b #8a8aa0",
     "tabbar.active":   "bg:#3b3b58 #ffffff bold",
+    "tabbar.btn":      "bg:#2a2a3f #d0d0e0",
+    "tabbar.btnoff":   "bg:#1c1c2b #45455a",
+    "tabbar.close":    "bg:#3b3b58 #ff8080 bold",
     "status":          "bg:#3b3b58 #d0d0e0",
     "status.key":      "bg:#3b3b58 #ffcc66 bold",
     "status.off":      "bg:#3b3b58 #ff8080 bold",
@@ -613,6 +670,23 @@ KEYS_HELP = [
     ("ctrl-r", "reload"), ("ctrl-c", "copy page"), ("ctrl-q", "quit"),
 ]
 
+# The rest of the bindings
+KEYS_MORE = [
+    ("1..9", "follow link 1-9 on the page"),
+    ("backspace", "back to the previous page"),
+    ("up/down", "scroll a line"),
+    ("pgup/pgdn", "scroll a screen"),
+    ("home", "back to the top"),
+    ("esc", "close the command line, or cancel a post"),
+]
+
+KEYS_BOARD = [
+    ("alt-1..9", "jump to board 1-9 in the sidebar"),
+    ("ctrl-p", "write a post: ctrl-s sends, esc cancels"),
+    ("ctrl-r", "reload the board for new posts"),
+    ("ctrl-b", "out of the boards, back to the index"),
+]
+
 @dataclass
 class Tab:
     # One open page. An empty one renders the start screen.
@@ -623,6 +697,7 @@ class Tab:
     messages: list[tuple[str, str]] = field(default_factory=list)
     scroll: int = 0
     loading: bool = False
+    loading_path: str | None = None  # what is being fetched, not what is shown
     nav: list[tuple[str, str]] = field(default_factory=list)
 
     @property
@@ -630,12 +705,21 @@ class Tab:
         return not self.text and not self.messages and not self.loading
 
     @property
+    def where(self) -> str:
+        if not self.text:
+            return "no page"
+        return f"{self.server}:{self.path}" if self.server else (self.path or "page")
+
+    @property
     def title(self) -> str:
         if self.loading:
-            return "loading…"
+            return f"→ {self.loading_path}" if self.loading_path else "loading…"
         if not self.text:
             return "new tab"
-        return f"{self.server}:{self.path}" if self.server else (self.path or "page")
+        return self.where
+
+# The tab a spawned command belongs to.
+_op_tab: ContextVar["Tab | None"] = ContextVar("vn_op_tab", default=None)
 
 class VagrantNetUI:
     def __init__(self) -> None:
@@ -655,14 +739,27 @@ class VagrantNetUI:
     def tab(self) -> Tab:
         return self.tabs[self.active]
 
+    def _here(self) -> str:
+        # The path the active tab is showing, or heading for while it loads.
+        return (t.loading_path if t.loading and t.loading_path else t.path) or ""
+
+    def _target_tab(self) -> Tab | None:
+        tab = _op_tab.get() or self.tab
+        return tab if tab in self.tabs else None
+
     def _emit(self, text: str = "") -> None:
+        tab = self._target_tab()
+        if tab is None:
+            return
         style = "class:msg.err" if re.match(r"(?i)\s*(no |not |.*failed|unknown|usage)", str(text)) else "class:msg"
         for line in str(text).splitlines() or [""]:
-            self.tab.messages.append((style, line))
+            tab.messages.append((style, line))
         self._refresh()
 
     def _show_page(self, server, path, text, links) -> None:
-        t = self.tab
+        t = self._target_tab()
+        if t is None:
+            return
         t.server, t.path, t.text, t.links = server, path, text, links
         t.messages.clear()
         t.scroll = 0
@@ -673,6 +770,19 @@ class VagrantNetUI:
             self.app.invalidate()
 
     # ---------------- rendering -------------------------------------------
+    def _tab_label(self, t: "Tab") -> str:
+        # Tab labeling logic
+        cols = self.app.output.get_size().columns if self.app else 80
+        # Per tab, besides the title: " n " + "x " + a trailing space.
+        room = (cols - len(TOOLBAR_LABELS) - 6) // max(1, len(self.tabs)) - 6
+        if room < 6:
+            # Too many tabs to name. The numbers still click, and the status
+            # bar underneath says where the active one is.
+            return ""
+        room = min(28, room)
+        title = t.title
+        return title if len(title) <= room else title[:room - 1] + "\u2026"
+
     def _content_height(self) -> int:
         rows = self.app.output.get_size().rows if self.app else 24
         return max(1, rows - 3 - (1 if self.cmd_open else 0))
@@ -694,7 +804,8 @@ class VagrantNetUI:
     def _board_handler(self, board: str):
         def handle(ev):
             if ev.event_type == MouseEventType.MOUSE_UP:
-                self._spawn(self.shell.enter_board(board))
+                self._spawn(self.shell.enter_board(board),
+                            f"{page.BOARD_PREFIX}/{board}")
                 return None
             return NotImplemented
         return handle
@@ -703,11 +814,12 @@ class VagrantNetUI:
         sh = self.shell
         out: list = [("class:side.title", " BOARDS\n")]
         if not sh.board_order:
-            out.append(("class:side.dim", " (none yet)\n"))
-            out.append(("class:side.dim", "\n ctrl-b to\n load them\n"))
+            # Only reachable on the board list of a server that has none.
+            out.append(("class:side.dim", " (none here)\n"))
+            out.append(("class:side.dim", "\n ctrl-b back\n to the index\n"))
             return out
 
-        here = sh._board_of(sh.current_path)
+        here = sh._board_of(self._here())
         for i, name in enumerate(sh.board_order, start=1):
             title = sh.boards.get(name, (name, 0))[0]
             unread = sh.unread(name)
@@ -718,7 +830,8 @@ class VagrantNetUI:
                 out.append(("class:side.unread", f"{unread:>3}\n", h))
             else:
                 out.append((style, "   \n", h))
-        out.append(("class:side.dim", "\n alt-<n> jump\n ctrl-p post\n"))
+        out.append(("class:side.dim",
+                    "\n alt-<n> jump\n ctrl-p post\n ctrl-b out\n"))
         return out
 
     def _compose_header(self) -> list:
@@ -753,11 +866,20 @@ class VagrantNetUI:
         sh = self.shell
         rest = (sh.current_path or "").strip("/")[len(page.BOARD_PREFIX) + 1:]
         in_thread = "/" in rest
+        where = sh.current_path
         if in_thread:
-            self._spawn(sh.post(body))
+            self._spawn(sh.post(body), where)
         else:
             subject, _, text = body.partition("\n")
-            self._spawn(sh.post(text.strip() or subject.strip(), subject.strip()))
+            self._spawn(sh.post(text.strip() or subject.strip(), subject.strip()), where)
+
+    def _open_server_handler(self, name: str):
+        def handle(ev):
+            if ev.event_type == MouseEventType.MOUSE_UP:
+                self._spawn(self.shell.open_page(name, "index.vn"), "index.vn")
+                return None
+            return NotImplemented
+        return handle
 
     def _splash_lines(self) -> list[list]:
         h = self._handler()
@@ -781,10 +903,20 @@ class VagrantNetUI:
             row([("class:splash.dim", "        nearby servers", h)])
             for i, f in enumerate(self.shell.found[:6], start=1):
                 where = f"{f.hops} hop" if f.reachable else "no path"
-                row([("class:splash.dim", "          ", h),
-                     ("class:page.linknum", f"{i}. ", h),
-                     ("class:splash.text", f"{f.name:<22}", h),
-                     ("class:splash.dim", f"{f.kind}, {where}", h)])
+                saved = self.shell.config.name_for(f.pubkey)
+                # Lead with the name `open` takes. Unsaved servers have none
+                label = saved or f.name
+                note = (f"{f.kind}, {where}" if saved
+                        else f"{f.kind}, {where} -- not saved")
+                click = self._open_server_handler(saved) if saved else h
+                style = "class:page.link" if saved else "class:splash.text"
+                row([("class:splash.dim", "          ", click),
+                     ("class:page.linknum", f"{i}. ", click),
+                     (style, f"{label:<22}", click),
+                     ("class:splash.dim", note, click)])
+                if not saved:
+                    row([("class:splash.dim",
+                          "             type  discover  for its key", h)])
             row([])
         servers = list(self.shell.config.servers)
         favs = self.shell.config.favorites
@@ -846,7 +978,8 @@ class VagrantNetUI:
     def _lines(self) -> list[list]:
         t = self.tab
         if t.loading:
-            return [[], [("class:splash.dim", f"  fetching {t.path or ''} …", self._handler())]]
+            what = t.loading_path or t.path or ""
+            return [[], [("class:splash.dim", f"  fetching {what} …", self._handler())]]
         if t.empty:
             return self._splash_lines()
         lines = self._page_lines() if t.text else []
@@ -867,8 +1000,56 @@ class VagrantNetUI:
             out.append(("", "\n"))
         return out
 
+    def _button(self, label: str, action, enabled: bool = True,
+                style: str = "class:tabbar.btn") -> tuple:
+        if not enabled:
+            return ("class:tabbar.btnoff", label)
+
+        def click(ev):
+            if ev.event_type != MouseEventType.MOUSE_UP:
+                return NotImplemented
+            action()
+            return None
+        return (style, label, click)
+
+    def _toolbar(self) -> list:
+        sh, t = self.shell, self.tab
+        here = self._here()
+        return [
+            self._button(" \u2190 ", self._click_back, bool(sh.nav_stack)),
+            ("class:tabbar", " "),
+            self._button(" \u21bb ", self._click_reload, bool(t.server and t.path)),
+            ("class:tabbar", " "),
+            self._button(" \u2302 ", self._click_home, sh.current_server is not None),
+            ("class:tabbar", " "),
+            self._button(" B ", self._click_boards, sh.current_server is not None,
+                         style=("class:tabbar.active" if sh.in_boards(here)
+                                else "class:tabbar.btn")),
+            ("class:tabbar", "  "),
+        ]
+
+    def _click_back(self) -> None:
+        stack = self.shell.nav_stack
+        self._spawn(self.shell.back(), stack[-1][1] if stack else None)
+
+    def _click_reload(self) -> None:
+        t = self.tab
+        if t.server and t.path:
+            self._spawn(self.shell.open_page(t.server, t.path, push_history=False),
+                        t.path)
+
+    def _click_home(self) -> None:
+        self._spawn(self.shell.home(), "index.vn")
+
+    def _click_boards(self) -> None:
+        # Same toggle as ctrl-b: in the boards it leaves them, outside it enters.
+        if self.shell.in_boards(self._here()):
+            self._spawn(self.shell.home(), "index.vn")
+        else:
+            self._spawn(self.shell.open_boards(), page.BOARD_PREFIX)
+
     def _tabbar(self):
-        frags = []
+        frags = self._toolbar()
         for i, t in enumerate(self.tabs):
             def sel(ev, i=i):
                 if ev.event_type == MouseEventType.MOUSE_UP:
@@ -877,8 +1058,16 @@ class VagrantNetUI:
                 else:
                     return NotImplemented
             style = "class:tabbar.active" if i == self.active else "class:tabbar.tab"
-            frags.append((style, f" {i + 1} {t.title} ", sel))
+            label = self._tab_label(t)
+            frags.append((style, f" {i + 1} {label} " if label else f" {i + 1} ", sel))
+            # A close box on the tab itself, where a browser puts it.
+            if label and (len(self.tabs) > 1 or not t.empty):
+                frags.append(self._button(
+                    "\u00d7 ", (lambda i=i: self._close_tab(i)),
+                    style=("class:tabbar.close" if i == self.active
+                           else "class:tabbar.tab")))
             frags.append(("class:tabbar", " "))
+        frags.append(self._button(" + ", self._new_tab))
         frags.append(("class:tabbar", ""))
         return frags
 
@@ -886,7 +1075,7 @@ class VagrantNetUI:
         t = self.tab
         conn = ("class:status.on", " connected ") if self.shell.client else \
                ("class:status.off", " offline ")
-        where = f"{t.server}:{t.path}" if t.text and t.server else "no page"
+        where = f"→ {t.loading_path}" if t.loading and t.loading_path else t.where
         lines = len(self._lines())
         pct = 100 if lines <= self._content_height() else \
             min(100, int(100 * (t.scroll + self._content_height()) / max(1, lines)))
@@ -909,15 +1098,17 @@ class VagrantNetUI:
     def _follow(self, idx: int | None) -> None:
         if idx is None or not (0 <= idx < len(self.tab.links)):
             return
-        self._spawn(self.shell.go(idx + 1))
+        self._spawn(self.shell.go(idx + 1), self.tab.links[idx].path)
 
-    def _spawn(self, coro) -> None:
+    def _spawn(self, coro, target: str | None = None) -> None:
         # Async updating tab without locking UI
         tab = self.tab
         tab.loading = True
+        tab.loading_path = target
         self._refresh()
 
         async def run():
+            _op_tab.set(tab)
             try:
                 await coro
             except Exception as exc:
@@ -926,6 +1117,7 @@ class VagrantNetUI:
                     tab.messages.append(("class:msg.err", f"{type(exc).__name__}: {exc}"))
             finally:
                 tab.loading = False
+                tab.loading_path = None
                 self._refresh()
 
         asyncio.ensure_future(run())
@@ -939,8 +1131,46 @@ class VagrantNetUI:
         if line in ("quit", "exit", "q"):
             self.app.exit()
             return False
-        self._spawn(self.shell.run_command(line))
+        if line == "help":
+            self._help_tab()
+            return False
+        self._spawn(self.shell.run_command(line), self._destination(line))
         return False
+
+    def _destination(self, line: str) -> str | None:
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            return None
+        if not parts:
+            return None
+        cmd, args = parts[0], parts[1:]
+        if cmd == "open":
+            return args[1] if len(args) > 1 else "index.vn"
+        if cmd == "boards":
+            return page.BOARD_PREFIX
+        if cmd == "home":
+            return "index.vn"
+        if cmd == "b" and args:
+            return f"{page.BOARD_PREFIX}/{args[0]}"
+        if cmd == "ls":
+            return LISTING_PATH
+        if cmd == "back":
+            stack = self.shell.nav_stack
+            return stack[-1][1] if stack else None
+        if cmd == "get" and args:
+            return args[0]
+        if cmd == "post":
+            return self.shell.current_path
+        if cmd == "go" and args and args[0].isdigit():
+            links = self.shell.current_links
+            n = int(args[0])
+            return links[n - 1].path if 1 <= n <= len(links) else None
+        if cmd == "fav" and args and args[0].isdigit():
+            favs = self.shell.config.favorites
+            n = int(args[0])
+            return favs[n - 1].path if 1 <= n <= len(favs) else None
+        return None
 
     def _focus_content(self) -> None:
         if self.app:
@@ -951,14 +1181,19 @@ class VagrantNetUI:
         self.active = len(self.tabs) - 1
         self._refresh()
 
-    def _close_tab(self) -> None:
+    def _close_tab(self, index: int | None = None) -> None:
+        i = self.active if index is None else index
+        if not (0 <= i < len(self.tabs)):
+            return
         if len(self.tabs) == 1:
             # Last tab: empty it on the UI
             self.tabs[0] = Tab()
             self.active = 0
         else:
-            self.tabs.pop(self.active)
-            self.active = min(self.active, len(self.tabs) - 1)
+            self.tabs.pop(i)
+            self.active = min(self.active if i > self.active else self.active - 1,
+                              len(self.tabs) - 1)
+            self.active = max(0, self.active)
         self._refresh()
 
     def _copy_page(self) -> None:
@@ -974,10 +1209,18 @@ class VagrantNetUI:
         self._emit(f"copied {len(payload)} bytes to the clipboard")
 
     def _help_tab(self) -> None:
+        sh = self.shell
+        in_board = sh.in_boards(self._here())
         rows = ["# vagrantNet", "", "## Keys", ""]
-        rows += [f"  {k:<10} {w}" for k, w in KEYS_HELP]
+        rows += [f"  {k:<10} {w}" for k, w in KEYS_HELP + KEYS_MORE]
         rows += ["", "## Commands", ""]
         rows += ["  " + l for l in HELP_TEXT.splitlines()]
+        if in_board:
+            # Only worth the screen space while a board is actually open.
+            rows += ["", "## In a board", ""]
+            rows += [f"  {k:<10} {w}" for k, w in KEYS_BOARD]
+            rows += [""]
+            rows += ["  " + l for l in BOARD_HELP.splitlines()]
         tab = Tab(server=None, path="help", text="\n".join(rows))
         self.tabs.append(tab)
         self.active = len(self.tabs) - 1
@@ -990,7 +1233,11 @@ class VagrantNetUI:
         insert = Condition(lambda: self.cmd_open or self.compose_open)
 
         @kb.add("c-b", filter=~insert)
-        def _(event): self._spawn(self.shell.open_boards())
+        def _(event):
+            if self.shell.in_boards(self._here()):
+                self._spawn(self.shell.home(), "index.vn")
+            else:
+                self._spawn(self.shell.open_boards(), page.BOARD_PREFIX)
 
         @kb.add("c-p", filter=~insert)
         def _(event): self._open_compose()
@@ -1009,7 +1256,8 @@ class VagrantNetUI:
             def _(event, n=n):
                 order = self.shell.board_order
                 if n <= len(order):
-                    self._spawn(self.shell.enter_board(order[n - 1]))
+                    self._spawn(self.shell.enter_board(order[n - 1]),
+                                f"{page.BOARD_PREFIX}/{order[n - 1]}")
 
         @kb.add("c-q")
         def _(event): event.app.exit()
@@ -1040,7 +1288,8 @@ class VagrantNetUI:
         def _(event):
             t = self.tab
             if t.server and t.path:
-                self._spawn(self.shell.open_page(t.server, t.path, push_history=False))
+                self._spawn(self.shell.open_page(t.server, t.path, push_history=False),
+                            t.path)
 
         @kb.add("c-c", filter=~insert)
         def _(event): self._copy_page()
@@ -1073,7 +1322,9 @@ class VagrantNetUI:
             self._refresh()
 
         @kb.add("backspace", filter=~insert)
-        def _(event): self._spawn(self.shell.back())
+        def _(event):
+            stack = self.shell.nav_stack
+            self._spawn(self.shell.back(), stack[-1][1] if stack else None)
 
         for n in range(1, 10):
             @kb.add(str(n), filter=~insert)
@@ -1087,7 +1338,8 @@ class VagrantNetUI:
         self.content_window = Window(self.content_control, wrap_lines=False)
         sidebar = ConditionalContainer(
             Window(FormattedTextControl(self._sidebar), width=21, style="class:side"),
-            filter=Condition(lambda: bool(self.shell.board_order)),
+            # Only while boards=true
+            filter=Condition(lambda: self.shell.in_boards(self._here())),
         )
         layout = Layout(HSplit([
             Window(FormattedTextControl(self._tabbar), height=1, style="class:tabbar"),
@@ -1124,7 +1376,10 @@ class _UILogHandler(logging.Handler):
 
     def emit(self, record):
         try:
-            self.ui.tab.messages.append(("class:msg.err", self.format(record)))
+            tab = self.ui._target_tab()
+            if tab is None:
+                return
+            tab.messages.append(("class:msg.err", self.format(record)))
             self.ui._refresh()
         except Exception:
             pass

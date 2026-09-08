@@ -29,6 +29,7 @@ DEFAULT_COLOUR = ""
 
 SERVER_DIRECTIVES = ("allow",)
 CLIENT_DIRECTIVES = ("seq", "bseq")  # read by the client
+COLOUR_DIRECTIVE = "c"
 FILES_LISTING_PATH = "files"  # server-generated listing of downloads_dir
 BOARD_PREFIX = "b"  # b, b/<board>, b/<board>:<seq> (new), b/<board>@<seq> (older)
 
@@ -42,6 +43,14 @@ _ANSI_COLOUR = {
     "white": "\x1b[37m", "dim": _ANSI_DIM,
 }
 
+def directive(raw: str) -> tuple[str, list[str]]:
+    # Split a "!name args" line into its name and arguments.
+    stripped = raw.strip()
+    if not stripped.startswith("!"):
+        return "", []
+    parts = stripped[1:].split()
+    return (parts[0], parts[1:]) if parts else ("", [])
+
 def is_page_path(path: str) -> bool:
     p = (path or "").strip("/")
     return (p in ("", FILES_LISTING_PATH) or p.endswith(".vn")
@@ -51,10 +60,10 @@ def board_seqs(vn_text: str) -> dict[str, int]:
     # !bseq <board> <seq> on the index, so one fetch gives every unread count.
     out: dict[str, int] = {}
     for raw in vn_text.splitlines():
-        parts = raw.strip()[1:].split() if raw.strip().startswith("!") else []
-        if len(parts) > 2 and parts[0] == "bseq":
+        name, args = directive(raw)
+        if name == "bseq" and len(args) > 1:
             try:
-                out[parts[1]] = int(parts[2])
+                out[args[0]] = int(args[1])
             except ValueError:
                 continue
     return out
@@ -62,10 +71,10 @@ def board_seqs(vn_text: str) -> dict[str, int]:
 def seq(vn_text: str) -> int | None:
     # Highest board sequence this page reflects, for tracking what's unread.
     for raw in vn_text.splitlines():
-        parts = raw.strip()[1:].split() if raw.strip().startswith("!") else []
-        if len(parts) > 1 and parts[0] == "seq":
+        name, args = directive(raw)
+        if name == "seq" and args:
             try:
-                return int(parts[1])
+                return int(args[0])
             except ValueError:
                 return None
     return None
@@ -86,20 +95,16 @@ def directives(vn_text: str) -> list[tuple[str, list[str]]]:
     # Server-side command processing
     out = []
     for raw in vn_text.splitlines():
-        stripped = raw.strip()
-        if not stripped.startswith("!"):
-            continue
-        parts = stripped[1:].split()
-        if parts and parts[0] in SERVER_DIRECTIVES:
-            out.append((parts[0], parts[1:]))
+        name, args = directive(raw)
+        if name in SERVER_DIRECTIVES:
+            out.append((name, args))
     return out
 
 def strip_server_directives(vn_text: str) -> str:
     # Page ready to transmit
     keep = []
     for raw in vn_text.splitlines():
-        parts = raw.strip()[1:].split() if raw.strip().startswith("!") else []
-        if parts and parts[0] in SERVER_DIRECTIVES:
+        if directive(raw)[0] in SERVER_DIRECTIVES:
             continue
         keep.append(raw)
     return "\n".join(keep) + ("\n" if vn_text.endswith("\n") else "")
@@ -112,12 +117,11 @@ def parse(vn_text: str) -> list[Line]:
         stripped = raw.strip()
 
         if stripped.startswith("!"):
-            parts = stripped[1:].split()
-            name = parts[0] if parts else ""
+            name, args = directive(raw)
             if name in SERVER_DIRECTIVES or name in CLIENT_DIRECTIVES:
                 continue
-            if name == "c":
-                arg = parts[1].lower() if len(parts) > 1 else ""
+            if name == COLOUR_DIRECTIVE:
+                arg = args[0].lower() if args else ""
                 colour = arg if arg in COLOURS else DEFAULT_COLOUR
                 continue
             # unknown directive, add as text
